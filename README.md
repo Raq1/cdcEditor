@@ -26,10 +26,12 @@ Allows to import character models, levels, animations, textures and cutscenes, w
 
 ---
 # Level Editing
-https://github.com/user-attachments/assets/cd3939a2-5a3e-4602-87a3-d5791a281a31
+https://github.com/user-attachments/assets/635d1063-a502-47e9-9694-a9f10cd3707d
 
 You can import levels, tweak ~almost~ everything to your liking and export back to the game. You can replace level geometry, textures, collision, change/add/delete instance spawns, tweak post processing effects, background objects, tweak lights, and more.
 
 # Model Editing
-<img width="1920" height="1080" alt="Desktop Screenshot 2026 07 06 - 20 58 34 94" src="https://github.com/user-attachments/assets/a2b786a9-52be-4aaf-9167-cbaa8d32bdf9" />
+<img width="1920" height="1080" alt="Desktop Screenshot 2026 07 06 - 20 58 34 94" src="https://github.com/user-attachments/assets/a2cf86f0-3955-4fa6-a74e-8fed6213537b" />
+
+
 You can import models, and either edit them or replace them with completely new character models.
