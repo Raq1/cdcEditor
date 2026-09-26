@@ -131,7 +131,6 @@ def _raw_prop_value(obj: Any, key: str, default: Any = None) -> Any:
 
 
 def cleanup_hinfo_custom_props(obj: Any, extra_keys: tuple[str, ...] = ()) -> None:
-    """Remove old HInfo panel-data ID properties after typed data is available."""
     data = get_hinfo_data(obj)
     if data is None:
         return

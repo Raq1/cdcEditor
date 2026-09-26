@@ -84,13 +84,6 @@ def _is_power_of_two(value: int) -> bool:
 
 
 def looks_like_ps2_pcd_bytes(pcd_bytes: bytes) -> bool:
-    """Cheap guard used to keep PS2 PCDs out of the PC/DDS decoder.
-
-    Known PS2 samples use a SECT wrapper, width/height/log2 fields at +0x1C,
-    and one of the observed GS setup values at +0x18.  The secondary shape
-    check catches future PS2 texture setup values so they log as unsupported
-    PS2 textures instead of falling into the PC PCD decoder.
-    """
     if len(pcd_bytes) < PS2_PCD_HEADER_SIZE:
         return False
     if _read_le_u32(pcd_bytes, 0x18) in PS2_PCD_MAGICS:
@@ -179,22 +172,6 @@ def parse_ps2_pcd_bytes(pcd_bytes: bytes) -> Optional[Ps2TextureData]:
 
 
 def parse_ps2_rgba32_pcd_bytes(pcd_bytes: bytes) -> Optional[Ps2TextureRgba32Data]:
-    """Parse the observed PS2 32-bit RGBA PCD variant.
-
-    Observed file body:
-      0x00 SECT section header
-      0x18 0x00700000 PS2 texture marker / GS texture setup value
-      0x1C u16 width
-      0x1E u16 height
-      0x20 u16 log2(width)
-      0x22 u16 log2(height)
-      0x24 u16 format-ish value, 0 in the current sample
-      0x48 linear top mip RGBA pixels
-
-    This variant has no 256-entry CLUT.  For the supplied 128x128 sample, the
-    bytes after +0x48 are already row-major RGBA pixels.  Earlier builds tried
-    to GS-unswizzle this payload; that produced block/diagonal corruption.
-    """
     if len(pcd_bytes) < PS2_PCD_HEADER_SIZE:
         return None
     if _read_le_u32(pcd_bytes, 0x18) != PS2_PCD_MAGIC_RGBA32:
@@ -228,14 +205,6 @@ def parse_ps2_rgba32_pcd_bytes(pcd_bytes: bytes) -> Optional[Ps2TextureRgba32Dat
 
 
 def parse_tr8_ps2_pcd_bytes(pcd_bytes: bytes) -> Optional[Ps2UnderworldTextureData]:
-    """Parse the Underworld PS2 LGS@ PCD top mip.
-
-    TR8 PS2 PCDs are still wrapped in SECT, but their texture body starts at
-    +0x18 with the LGS@ marker instead of the older TRL/TRA GS setup word.  The
-    supplied Underworld samples contain indexed 8-bit and indexed 4-bit top
-    mips.  This parser exposes the largest/top mip only; smaller mips and GS
-    packet metadata are intentionally ignored by the Blender importer.
-    """
     if len(pcd_bytes) < TR8_PS2_PCD_PALETTE_OFFSET:
         return None
     if _read_le_u32(pcd_bytes, TR8_PS2_PCD_HEADER_OFFSET) != TR8_PS2_PCD_MAGIC:
@@ -319,12 +288,6 @@ def _expand_indexed4_nibbles(raw: bytes, width: int, height: int) -> bytearray:
 
 
 def _unswizzle_ps2_palette_rgba(raw_palette: bytes) -> bytearray:
-    """Undo the standard PS2 8-bit CLUT block swap.
-
-    PS2 CSM1 8-bit palettes store colors in 32-entry groups where entries
-    8..15 and 16..23 are exchanged.  The texture indices are already in the
-    logical palette domain, so the CLUT must be rearranged before expansion.
-    """
     if len(raw_palette) < PS2_PCD_PALETTE_SIZE:
         raise ValueError(f'Truncated PS2 PCD palette: expected 1024 bytes, got {len(raw_palette)}')
 
@@ -340,7 +303,6 @@ def _unswizzle_ps2_palette_rgba(raw_palette: bytes) -> bytearray:
 
 
 def _unswizzle_psmt8(swizzled: bytes, width: int, height: int) -> bytearray:
-    """Convert PS2 PSMT8 texture memory order to linear row-major indices."""
     required_size = width * height
     if len(swizzled) < required_size:
         raise ValueError(f'Truncated PS2 PSMT8 texture data: expected {required_size} bytes, got {len(swizzled)}')
@@ -425,10 +387,6 @@ def decode_supported_ps2_texture(pcd_bytes: bytes) -> Optional[dict]:
             indices = _unswizzle_psmt8(tr8_texture.index_data, tr8_texture.width, tr8_texture.height)
             variant = 'tr8_lgs_psmt8_clut'
         else:
-            # First-pass PSMT4 support: the supplied assets that use this path are
-            # auxiliary/small maps.  Expand nibbles linearly; if future models expose
-            # obvious PSMT4 swizzle corruption, this should be replaced with a full GS
-            # PSMT4 unswizzler.
             palette = bytearray(tr8_texture.palette_rgba)
             indices = _expand_indexed4_nibbles(tr8_texture.index_data, tr8_texture.width, tr8_texture.height)
             variant = 'tr8_lgs_psmt4_clut_linear'
@@ -522,7 +480,6 @@ def _scale_to_ps2_alpha(alpha: int) -> int:
 
 
 def _swizzle_ps2_palette_rgba(logical_palette: bytes) -> bytearray:
-    """Apply the standard PS2 8-bit CLUT block swap used by the decoder above."""
     if len(logical_palette) < PS2_PCD_PALETTE_SIZE:
         raise ValueError(f'Truncated PS2 palette: expected 1024 bytes, got {len(logical_palette)}')
     raw = bytearray(PS2_PCD_PALETTE_SIZE)
@@ -537,7 +494,6 @@ def _swizzle_ps2_palette_rgba(logical_palette: bytes) -> bytearray:
 
 
 def _swizzle_psmt8(linear: bytes, width: int, height: int) -> bytearray:
-    """Convert row-major 8-bit indices to the PS2 PSMT8 memory order."""
     required_size = int(width) * int(height)
     if len(linear) < required_size:
         raise ValueError(f'Truncated linear PS2 PSMT8 source data: expected {required_size} bytes, got {len(linear)}')
@@ -569,12 +525,6 @@ def _flip_linear_indices_y(indices: bytes, width: int, height: int) -> bytearray
 
 
 def build_ps2_rgba32_pcd_body(rgba_top_left: bytes, width: int, height: int, *, format_id: int = 0) -> bytes:
-    """Build a PS2 RGBA32 PCD section payload body.
-
-    The returned bytes are the standalone-section payload, not the SECT wrapper.
-    Existing readers see the magic at full-file offset +0x18 after the section
-    wrapper is added by the exporter.
-    """
     width = int(width)
     height = int(height)
     log_width = _log2_power_of_two(width)
@@ -601,13 +551,6 @@ def build_ps2_rgba32_pcd_body(rgba_top_left: bytes, width: int, height: int, *, 
 
 
 def _ps2_indexed8_mip_dimensions(width: int, height: int) -> list[tuple[int, int]]:
-    """Return the PS2 indexed top-mip chain used by observed TRA/TRL PCDs.
-
-    The game assets store the top level plus smaller levels down to 4x4.
-    Earlier exporter builds wrote only the top mip.  The add-on could still
-    re-import that, but the PS2 loader/runtime expects the full packet chain
-    described by the texture header and can hang when those packets are absent.
-    """
     dims: list[tuple[int, int]] = []
     w = int(width)
     h = int(height)
@@ -722,13 +665,6 @@ def _downsample_indexed8_level(prev_indices: bytes, prev_width: int, prev_height
 
 
 def build_ps2_indexed8_pcd_body(index_top_left: bytes, logical_palette_rgba: bytes, width: int, height: int, *, format_id: int = 0, magic: int = PS2_PCD_MAGIC_INDEXED8, template_body: bytes | None = None) -> bytes:
-    """Build an observed PS2 PSMT8+RGBA8888-CLUT PCD section payload body.
-
-    The returned body includes the PS2 texture setup header, CLUT, and every
-    8-bit mip packet down to 4x4.  The first-pass exporter originally wrote
-    only the top mip and zeroed the runtime header fields at 0x0C..0x2F.  That
-    was enough for the add-on decoder, but not for the game's texture loader.
-    """
     width = int(width)
     height = int(height)
     log_width = _log2_power_of_two(width)

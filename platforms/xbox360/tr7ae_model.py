@@ -30,18 +30,6 @@ class TRXbox360ModelParser(TRPS3ModelParser):
         vertex_count: int,
         segments: List[Segment],
     ) -> Tuple[List[MVertex], int, int]:
-        """Read the Xbox 360 external render-stream variant.
-
-        The PS3 external reader treats the first word at +0x68 as a vertex-data
-        pointer.  Xbox 360 files store a small header instead:
-
-            +0x00 u32 vertex_count
-            +0x04 u32 vertex_record_pointer
-
-        The vertex records are interleaved 36-byte entries.  Reading this stream
-        as PS3-style 16-byte primary records plus a detached 20-byte secondary
-        stream makes the model explode into a cube of random triangles.
-        """
         if vertex_header_abs <= 0 or vertex_header_abs + 8 > vertex_stream_ctx.file_size:
             return [], int(vertex_count), 0
 

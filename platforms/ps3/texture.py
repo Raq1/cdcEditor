@@ -28,13 +28,9 @@ def _calc_mipmap_count(width: int, height: int, block_bytes: int, payload_size: 
 
 
 def _standalone_section_payload_offset(pcd_bytes: bytes) -> int | None:
-    """Return the payload offset for a standalone extracted section, if present."""
     if len(pcd_bytes) < 24 or pcd_bytes[:4] not in {b'SECT', b'TCES'}:
         return None
 
-    # Standalone PS3 sections are big-endian and pack the relocation count in
-    # the low 16 bits for several files, but older extracted sections may still
-    # use the normal count shifted by 8. Try both and keep the one that fits.
     try:
         packed_data = int(unpack_from('>I', pcd_bytes, 12)[0])
     except Exception:
@@ -55,14 +51,6 @@ def _standalone_section_payload_offset(pcd_bytes: bytes) -> int | None:
 
 
 def _iter_ps3_texture_header_candidates(pcd_bytes: bytes):
-    """Yield candidate PS3 texture headers.
-
-    Most observed PS3 PCD sections contain a small PS3T header.  Some extracted
-    or tool-converted sections may omit the literal PS3T marker while keeping
-    the same big-endian header layout starting at the section payload.  The
-    decoder accepts both forms, but validates size/format/dimensions before
-    returning a texture.
-    """
     if not pcd_bytes:
         return
 

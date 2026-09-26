@@ -15,6 +15,7 @@ import mathutils
 
 from ..core.blender_mesh_utils import armature_bone_count
 from ..core.log import logger
+from ..core.mul_subtitles import MUL_SUBTITLE_TEXT_PROP, format_subtitle_text, normalize_subtitle_frames, subtitle_blob_has_data
 from .animation_types import TRLAUBoneAnimation, TRLAUKeyframe, TRLAUTrack, TRLAUTransformAnimation, TRLAUTransformType
 
 
@@ -142,12 +143,6 @@ class MultiplexStreamImporterMixin:
         }
 
     def _read_mul_cine_header_legacy(self, data: bytes, offset: int, endian: str = '<') -> tuple[dict, int]:
-        """Read the older/guessed MUL CINE header layout.
-
-        TRU PC CINE packets use a different object descriptor layout; the public
-        method below detects that format first and falls back here only when the
-        descriptor scanner cannot find a usable TRU-style header.
-        """
         stream = BytesIO(data)
         stream.seek(offset)
 
@@ -232,19 +227,13 @@ class MultiplexStreamImporterMixin:
                 'final_unit_id': final_unit_id,
             })
 
-        # Some original Xbox Legend MUL CINE packets use the older header layout but
-        # store one more camera channel than the original PC/PS2 estimate.  Frame 0
-        # initializes every channel, but frame_size can also include internal zero
-        # padding.  Do not treat padding as another channel; validate inferred extra
-        # channels by walking the frame-0 run/value pairs and requiring positive run
-        # lengths.
         try:
             frame_offset = stream.tell()
             if frame_offset + MUL_FRAME_HEADER_SIZE <= len(data):
                 first_frame_size, first_frame_number = struct.unpack_from(endian + 'ii', data, frame_offset)
-                frame_record_end = frame_offset + int(first_frame_size)
-                if first_frame_number >= 0 and first_frame_size >= MUL_FRAME_HEADER_SIZE and frame_record_end <= len(data):
-                    max_initial_channel_count = (int(first_frame_size) - MUL_FRAME_HEADER_SIZE) // 8
+                frame_record_end = frame_offset + 4 + int(first_frame_size)
+                if first_frame_number >= 0 and first_frame_size >= 4 and frame_record_end <= len(data):
+                    max_initial_channel_count = max(0, (int(first_frame_size) - 4) // 8)
 
                     def frame0_candidate_is_valid(candidate_count: int) -> bool:
                         value_offset = frame_offset + MUL_FRAME_HEADER_SIZE
@@ -298,18 +287,6 @@ class MultiplexStreamImporterMixin:
         return header, stream.tell()
 
     def _read_mul_cine_header(self, data: bytes, offset: int, endian: str = '<') -> tuple[dict, int]:
-        """Read a MUL CINE header and return the first CineFrame offset.
-
-        Tomb Raider: Underworld PC stores CINE object descriptors as:
-
-            i32 instance_id, i32 parent_id, i32 bone_count, i32 first_channel,
-            followed by bone_count 4x4 default matrices.
-
-        Each object uses three root channels and fourteen channels per bone.  The
-        first frame initializes every channel, so its payload size is a reliable
-        channel-count source even when the header contains unknown channel blocks
-        between objects.
-        """
 
         def read_i32_at(pos: int) -> int:
             return struct.unpack_from(endian + 'i', data, pos)[0]
@@ -328,10 +305,6 @@ class MultiplexStreamImporterMixin:
         header_size = read_i32_at(offset + 8)
         name = data[offset + 0x0C:offset + 0x0C + 0x40].split(b'\x00', 1)[0].decode('ascii', errors='ignore')
 
-        # In TRU PC files the stored CINE header size excludes the first 8 bytes
-        # (magic + version).  Older layouts may use a different convention, so keep
-        # two conservative candidates and choose the first one that looks like a
-        # CineFrame header.
         frame_offset_candidates = [offset + int(header_size) + 8, offset + int(header_size)]
         frame_offset = 0
         first_frame_size = 0
@@ -343,7 +316,7 @@ class MultiplexStreamImporterMixin:
                 candidate_size, candidate_number = struct.unpack_from(endian + 'ii', data, candidate)
             except Exception:
                 continue
-            if candidate_size >= MUL_FRAME_HEADER_SIZE and candidate + candidate_size <= len(data):
+            if candidate_size >= 4 and candidate + 4 + candidate_size <= len(data):
                 frame_offset = int(candidate)
                 first_frame_size = int(candidate_size)
                 first_frame_number = int(candidate_number)
@@ -352,18 +325,9 @@ class MultiplexStreamImporterMixin:
         if frame_offset <= 0:
             return self._read_mul_cine_header_legacy(data, offset, endian=endian)
 
-        first_frame_payload_size = max(0, int(first_frame_size) - MUL_FRAME_HEADER_SIZE)
-        # Frame 0 contains an initial run word and an initial float value for every
-        # channel.  A few TRU files keep a 4-byte subtitle/pad word inside the frame;
-        # integer division intentionally ignores that pad.
+        first_frame_payload_size = max(0, int(first_frame_size) - 4)
         initial_channel_count = int(first_frame_payload_size // 8) if first_frame_number >= 0 else 0
 
-        # Legend/Anniversary PC MULs use the older version-5 CINE header layout even
-        # though they still have a normal ENIC packet and a valid frame offset.  The
-        # TRU descriptor scanner below can accept false descriptors inside default
-        # matrices; the usual bad symptom is instance id 0x3F800000 (float 1.0) and
-        # no camera descriptor.  Prefer the explicit legacy layout for version 5 and
-        # only fall back to the scanner if that parse fails.
         if int(version) <= 5:
             try:
                 return self._read_mul_cine_header_legacy(data, offset, endian=endian)
@@ -601,6 +565,11 @@ class MultiplexStreamImporterMixin:
                 cine_header['packet_alignment'] = packet_alignment
                 cine_header['sound_header_size'] = int(platform_info.get('sound_header_size', 0x10))
                 cine_header['audio_codec'] = platform_info.get('audio_codec', 'lau_adpcm')
+                try:
+                    cine_header['stream_has_subtitles'] = bool(struct.unpack_from(endian + 'i', data, 9 * 4)[0])
+                except Exception:
+                    cine_header['stream_has_subtitles'] = bool(cine_header.get('num_subtitles', 0))
+                cine_header['subtitle_frames'] = []
                 logger.info(
                     'MUL cine header: name=%s version=%s anchors=%d skeletons=%d cameras=%d channels=%d main_unit_id=%d',
                     cine_header.get('name', ''),
@@ -662,8 +631,8 @@ class MultiplexStreamImporterMixin:
 
             while frame_offset + MUL_FRAME_HEADER_SIZE <= packet_data_end:
                 frame_size, frame_number = struct.unpack_from(endian + 'ii', data, frame_offset)
-                frame_record_end = frame_offset + max(int(frame_size), 0)
-                if frame_size < MUL_FRAME_HEADER_SIZE or frame_record_end > packet_data_end:
+                frame_record_end = frame_offset + 4 + max(int(frame_size), 0)
+                if frame_size < 4 or frame_record_end > packet_data_end:
                     logger.debug(
                         'Stopping MUL frame parse at packet %d offset 0x%X: invalid frame_size=%d packet_end=0x%X',
                         packet_index,
@@ -708,6 +677,10 @@ class MultiplexStreamImporterMixin:
 
                     channel_run_lengths[channel_index] -= 1
 
+                subtitle_blob = bytes(data[value_offset:frame_record_end])
+                if subtitle_blob:
+                    cine_header.setdefault('subtitle_frames', []).append((int(frame_number), subtitle_blob))
+
                 for skeleton_index, skeleton in enumerate(cine_header['skeletons']):
                     skeleton_first_channel = int(skeleton['first_channel'])
                     root_channel_count = int(skeleton.get('root_channel_count', MUL_SKELETON_ROOT_CHANNEL_COUNT) or MUL_SKELETON_ROOT_CHANNEL_COUNT)
@@ -724,11 +697,6 @@ class MultiplexStreamImporterMixin:
                         channel_base = first_channel + (bone_index * bone_channel_stride)
                         if channel_base + MUL_BONE_FLAGS_OFFSET >= len(channel_values):
                             continue
-                        # TRU PC stores 14 channels per bone. The first ten are the
-                        # useful transform channels: scale XYZ, Euler rotation XYZ,
-                        # location XYZ, and a flags/value channel. The remaining four
-                        # channels are currently unknown and are preserved only by the
-                        # original stream, not by the editable transform payload.
                         skeleton_frames[skeleton_index]['frames'][bone_index].append((
                             int(frame_number),
                             (
@@ -933,12 +901,6 @@ class MultiplexStreamImporterMixin:
         skeleton_frames: list[dict],
         camera_frames: list[dict],
     ) -> dict:
-        # Keep this payload in Python-native form and serialize it with pickle.
-        # The previous implementation expanded every frame into JSON, which can
-        # become very large and makes Blender appear to hang immediately after
-        # the packet parser finishes. The panel reads lightweight metadata from
-        # the Empty custom properties; this heavy payload is decoded only when a
-        # skeleton is actually applied to an armature.
         header_skeletons = []
         for skeleton in cine_header.get('skeletons', []) or []:
             header_skeletons.append({
@@ -976,6 +938,8 @@ class MultiplexStreamImporterMixin:
         return {
             'schema': 2,
             'source': str(filepath),
+            'platform': str(cine_header.get('platform', 'pc') or 'pc'),
+            'endian': str(cine_header.get('endian', '<') or '<'),
             'name': str(cine_header.get('name', Path(filepath).stem) or Path(filepath).stem),
             'main_unit_id': int(cine_header.get('main_unit_id', -1)),
             'anchors': [
@@ -988,6 +952,11 @@ class MultiplexStreamImporterMixin:
             ],
             'trigger_unit_id': int(cine_header.get('trigger_unit_id', -1)),
             'num_subtitles': int(cine_header.get('num_subtitles', 0)),
+            'stream_has_subtitles': bool(cine_header.get('stream_has_subtitles', False)),
+            'subtitle_frames': [
+                (int(frame), bytes(blob))
+                for frame, blob in sorted(normalize_subtitle_frames(cine_header.get('subtitle_frames', [])).items())
+            ],
             'skeleton_headers': header_skeletons,
             'skeleton_frames': compact_skeleton_frames,
             'camera_frames': [
@@ -1013,9 +982,6 @@ class MultiplexStreamImporterMixin:
 
     @staticmethod
     def _encode_multiplex_storage_payload(payload: dict) -> str:
-        # Keep import responsive. The payload is already hidden on the Multiplex
-        # Empty, so a lower zlib level and no cosmetic line wrapping are better
-        # tradeoffs than maximum compression during import.
         raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
         compressed = zlib.compress(raw, level=1)
         encoded = base64.b64encode(compressed).decode('ascii')
@@ -1157,9 +1123,6 @@ class MultiplexStreamImporterMixin:
                 empty['trlau_mul_audio_enabled'] = False
             empty['trlau_mul_audio_wav_path'] = str(audio_result.get('audio_wav_path', '') or '')
 
-        # Pre-create the per-skeleton UI binding rows while importing. Do not
-        # create them lazily from the panel draw callback: Blender forbids
-        # writing to ID data while UI panels are drawing.
         if hasattr(empty, 'trlau_multiplex_skeleton_bindings'):
             bindings = empty.trlau_multiplex_skeleton_bindings
             try:
@@ -1172,6 +1135,27 @@ class MultiplexStreamImporterMixin:
 
         logger.info('Writing MUL Multiplex payload object chunks: chars=%d', len(encoded_payload))
         self._write_multiplex_storage_payload_to_object(empty, encoded_payload)
+
+        subtitle_frames = normalize_subtitle_frames(cine_header.get('subtitle_frames', []))
+        has_subtitle_data = any(subtitle_blob_has_data(blob) for blob in subtitle_frames.values())
+        if bool(cine_header.get('stream_has_subtitles', False)) or int(cine_header.get('num_subtitles', 0) or 0) > 0 or has_subtitle_data:
+            subtitle_text = bpy.data.texts.new(f'{path.stem}_subtitles.txt')
+            subtitle_text.write(format_subtitle_text(
+                int(cine_header.get('num_subtitles', 0) or 0),
+                subtitle_frames,
+                endian=str(cine_header.get('endian', '<') or '<'),
+            ))
+            try:
+                subtitle_text.use_fake_user = True
+            except Exception:
+                pass
+            empty[MUL_SUBTITLE_TEXT_PROP] = subtitle_text.name
+            logger.info(
+                'Imported MUL subtitle data into Blender Text %s: declared=%d active_frames=%d',
+                subtitle_text.name,
+                int(cine_header.get('num_subtitles', 0) or 0),
+                sum(1 for blob in subtitle_frames.values() if subtitle_blob_has_data(blob)),
+            )
 
         target_collection = collection or context.collection or context.scene.collection
         target_collection.objects.link(empty)
@@ -1255,23 +1239,6 @@ class MultiplexStreamImporterMixin:
         rotation_values = tuple(float(v) for v in frame_info.get('rotation', (0.0, 0.0, 0.0)))
         scale_values = tuple(float(v) for v in frame_info.get('scale', (1.0, 1.0, 1.0)))
 
-        # MUL default transforms are stored as default-pose/global bone
-        # orientations, not local parent-relative bone deltas. Convert them to a
-        # local orientation before composing the source bone matrix:
-        #
-        #   local_default = inverse(parent_default_global) @ bone_default_global
-        #
-        # The channel translation is stored in the parent's default/global basis,
-        # so convert it back to Blender/rest local space with inverse(parent D).
-        #
-        # The channel rotation is still best applied before the local default
-        # orientation, as in v8. The previous v8 build interpreted the XYZ triple
-        # as a single exponential-map vector. That is identical to Euler XYZ for
-        # one-axis bones, but it introduces small unwanted cross-axis rotations
-        # when two or three axes are keyed. Treat the triple as Euler XYZ, then
-        # conjugate the resulting rotation matrix out of the parent's default
-        # basis. This keeps the v8 arm/default behavior but removes the residual
-        # multi-axis drift.
         parent_default_orientation = MultiplexStreamImporterMixin._mul_orientation_only_matrix(parent_default_matrix)
         parent_default_orientation_3x3 = parent_default_orientation.to_3x3()
         inverse_parent_default_orientation_3x3 = parent_default_orientation_3x3.inverted_safe()
@@ -1633,11 +1600,6 @@ class MultiplexStreamImporterMixin:
                 previous_quaternion_by_bone[bone_index] = quaternion.copy()
 
                 if preserve_bone_positions:
-                    # Retarget/proportions mode: keep root motion and import
-                    # child locations as deltas around the target armature's
-                    # own rest layout.  This preserves useful translation keys
-                    # without forcing the source skeleton's bone lengths onto
-                    # the selected armature.
                     if pose_bone.parent is None:
                         write_location = location
                     else:
@@ -2051,10 +2013,6 @@ class MultiplexStreamImporterMixin:
             right_volumes = tuple(1.0 if channel_index == 1 else 0.0 for channel_index in range(12))
         else:
             try:
-                # TRU PC keeps one extra 32-bit field before mediaLength.  Older code
-                # treated mediaLength as part of the left-volume table, which made the
-                # first decoded audio channel far too loud in files whose mediaLength is
-                # a large frame count such as 338.0 or 346.0.
                 (
                     loop_start_file_offset,
                     loop_start_bundle_offset,
@@ -2076,12 +2034,6 @@ class MultiplexStreamImporterMixin:
 
         dsp_coefficients = []
         if audio_codec == 'gc_dsp_adpcm':
-            # Nintendo GameCube/Wii MUL sound packets carry Nintendo DSP ADPCM frames.
-            # The stream header stores a compact per-channel DSP setup block. The first
-            # channel's 16 signed predictor coefficients start at 0xCC; subsequent
-            # coefficient tables are spaced by 0x2E bytes. The previous implementation
-            # used a 0x30 stride, which shifted channel 1's coefficients by two bytes
-            # and produced severe clipping/crackle.
             for channel_index in range(int(audio_channel_count)):
                 coeff_offset = MUL_DSP_CHANNEL_HEADERS_OFFSET + (channel_index * MUL_DSP_CHANNEL_HEADER_SIZE)
                 if coeff_offset + 32 > len(data):
@@ -2395,9 +2347,6 @@ class MultiplexStreamImporterMixin:
         right_has_gain = any(abs(float(v)) > 1e-8 for v in right_volumes)
 
         if num_channels == 1:
-            # Retail MULs frequently store mono dialogue/music.  Some headers expose
-            # only one side in the volume table, but the decoded WAV bridge should be
-            # centered so Blender does not play the whole track from one speaker.
             mono_gain = max(abs(float(left_volumes[0])), abs(float(right_volumes[0])), 1.0)
             left_volumes = (mono_gain,)
             right_volumes = (mono_gain,)
@@ -2490,9 +2439,6 @@ class MultiplexStreamImporterMixin:
 
     @staticmethod
     def _mul_delete_temp_file_later(temp_path: Path) -> None:
-        # Blender may lazily initialize sound strips after new_sound() returns.
-        # Deferring deletion avoids invalidating a just-created sound strip while
-        # still keeping the decoded WAV out of the user's project folder.
         def delete_temp_file():
             try:
                 temp_path.unlink(missing_ok=True)
@@ -2652,9 +2598,6 @@ class MultiplexStreamImporterMixin:
                     pass
                 self._mul_set_sound_cache(strip_sound)
 
-                # Prefer the explicitly loaded sound datablock when Blender allows assignment.
-                # Some Blender builds do not allow this on sound strips; the strip remains usable
-                # with its own file-backed Sound datablock in that case.
                 if sound is not None and sound is not strip_sound:
                     try:
                         strip.sound = sound

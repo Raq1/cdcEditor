@@ -604,10 +604,6 @@ class MaterialNodeBuilderMixin:
             )
             vertex_alpha_output = self._vertex_alpha_socket(vertex_color) if use_vertex_color_alpha else None
             if vertex_alpha_output is not None and blend_value == 1:
-                # Xbox 360 vertex colors can still contribute alpha on Blend 1.
-                # PS3 keeps the secondary-stream alpha as imported color data
-                # only; routing it into material transparency makes the preview
-                # visibly wrong on the supplied PS3 samples.
                 alpha_output = self._create_multiply_value_node(
                     nodes,
                     links,
@@ -1585,9 +1581,6 @@ class MaterialNodeBuilderMixin:
             value = 0.0
         if value <= 0.0 and not has_specular_map:
             return 0.0
-        # Give the imported exponent an immediate viewport effect even when the
-        # specular mask is weak or absent.  The texture still modulates the input
-        # when present; this default only establishes the base response.
         return max(0.05, min(1.0, 0.25 + (value / (value + 32.0))))
 
     def _pc_nextgen_attach_specular_map(
@@ -1658,9 +1651,6 @@ class MaterialNodeBuilderMixin:
             except Exception:
                 pass
 
-        # The next-gen PC specular layer is effectively a gloss/specular mask.
-        # Feed an inverted luminance approximation into Roughness so high gloss
-        # areas actually look sharper in Blender instead of staying flat.
         roughness_input = bsdf.inputs.get('Roughness')
         if roughness_input is not None:
             try:
@@ -1743,12 +1733,6 @@ class MaterialNodeBuilderMixin:
 
     @staticmethod
     def _pc_nextgen_uses_vertex_color_lighting(material) -> bool:
-        # PCMaterialData stores shader *table indices*, not global shader ids.
-        # The same no-diffuse-vertex-color SinglePass Light PS 3.0 shader is
-        # resource 682, but it appears as index 22 in Lara and as index 5 in
-        # several smaller sample tables. Resolve through the imported shader
-        # table first; only fall back to the old raw-index test when the table
-        # is unavailable.
         resolved_ps30_shader_id = MaterialNodeBuilderMixin._pc_nextgen_resolved_singlepass_light_ps30_id(material)
         if resolved_ps30_shader_id is not None:
             return int(resolved_ps30_shader_id) != 682
@@ -1756,11 +1740,6 @@ class MaterialNodeBuilderMixin:
 
     @staticmethod
     def _pc_nextgen_uses_vertex_color_specular_tint(material) -> bool:
-        # Shader resource 682 does not multiply vertex RGB into diffuse/base
-        # lighting, but Lara samples show the same vertex RGB is still consumed
-        # by the specular path.  In material slots 12-15 the authored vertex RGB
-        # is black, which suppresses/tints the specular layer without blackening
-        # the diffuse texture.
         resolved_ps30_shader_id = MaterialNodeBuilderMixin._pc_nextgen_resolved_singlepass_light_ps30_id(material)
         if resolved_ps30_shader_id is not None:
             return int(resolved_ps30_shader_id) == 682
@@ -1789,10 +1768,6 @@ class MaterialNodeBuilderMixin:
         rim_color = rim_colors[0] if rim_colors else (0.0, 0.0, 0.0, 0.0)
 
         local_tpage_flags = dict(tpage_flags or _decode_tpage_flags(0))
-        # PCMaterialData has its own render state.  Keep the old tpage flags as
-        # metadata only; do not let them impose legacy culling/alpha behaviour.
-        # The authored PC Next-Gen Double Sided flag is the Blender viewport
-        # culling source of truth: enabled means backface culling must be off.
         local_tpage_flags['single_sided'] = 0 if double_sided else 1
         local_tpage_flags['cull_mode'] = 0
         blend_method = 'OPAQUE'
@@ -1808,14 +1783,7 @@ class MaterialNodeBuilderMixin:
             output_location=(980, 0),
             shadow_method='HASHED' if blend_method == 'BLEND' else None,
         )
-        # Keep PC next-gen material names on the same Material_<index>_<textureID>
-        # scheme used by old-gen imports.  Do not append blend/combiner labels
-        # to the Blender material name; those values are editable in the panel.
 
-        # Make the complete layer table visible in the node tree.  Only the
-        # documented primary roles are connected to Principled, but extra layers
-        # are still created/labeled so the material is inspectable instead of
-        # silently collapsing back to a single old-gen diffuse texture.
         layer_nodes = {}
         for layer_index, layer_image in enumerate(layer_images or []):
             if layer_image is None:
@@ -1960,10 +1928,6 @@ class MaterialNodeBuilderMixin:
             material.blend_method = 'BLEND'
 
         if combiner_type in {2, 3, 4}:
-            # Reflection variants use reflection-vector texcoord sources in the
-            # game.  Blender cannot directly reproduce that fixed-function setup
-            # here, but using the diffuse/reflection layer as an overlay gives a
-            # visibly distinct material instead of the old flat diffuse fallback.
             reflection_image = None
             for layer_index, texcoord_source in enumerate(layer_texcoord_sources):
                 if int(texcoord_source) in {6, 9} and layer_index < len(layer_images):

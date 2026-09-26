@@ -65,15 +65,6 @@ def _warn(callback: Callable[[str], None] | None, message: str) -> None:
 def is_pc_nextgen_mesh_object(obj) -> bool:
     if obj is None or getattr(obj, 'type', None) != 'MESH':
         return False
-    # Classify the mesh object itself, not the materials assigned to it.
-    #
-    # Older builds treated any mesh using a PC Next-Gen material as a next-gen
-    # mesh.  That is too broad now that materials can be converted/authored
-    # from the main Material panel: an ordinary model mesh may temporarily hold
-    # PC Next-Gen materials, and the old-gen exporter must still see that mesh.
-    #
-    # Next-gen render meshes are identified by explicit object/data metadata or
-    # the import/export naming convention.
     try:
         if bool(getattr(obj, 'trlau_pc_nextgen_mesh', False)) or bool(obj.get('trlau_pc_nextgen_mesh', False)):
             return True
@@ -156,9 +147,6 @@ def find_nextgen_section_template(directory: Path, render_id: int) -> Path | Non
 
 def _read_template_parser(path: Path, render_id: int):
     parser = TRNextGenModelParser(str(path), cdc_render_data_id=int(render_id))
-    # parse() sets the parser's resolved standalone-data offsets and validates
-    # that this is really a PCD9 next-gen section.  The returned ModelData is not
-    # used by the exporter; the parser state is used as a template map below.
     parser.parse()
     header_offsets = parser._read_nextgen_header_offsets()
     pc_base = parser._find_pcmodeldata_base(header_offsets[0])
@@ -249,10 +237,6 @@ def _material_prop(material, name: str, default=None):
             return value
     except Exception:
         pass
-    # Compatibility fallback: a next-gen mesh may intentionally use a PC
-    # Old-Gen/PS3/Xbox material.  Treat the material Type as an authoring UI
-    # layout, not a blocker.  Missing PC Next-Gen fields are synthesized here
-    # so export can continue without forcing the user to convert materials.
     try:
         fallback = _pc_nextgen_fallback_material_prop(material, name, default)
         return fallback
@@ -280,10 +264,6 @@ def _has_pc_nextgen_layout(material) -> bool:
 
 
 def _pc_nextgen_maybe_sync_material(material) -> None:
-    # sync_pc_nextgen_material_from_panel() intentionally switches the material
-    # platform to PC Next-Gen.  Only call it when the material already has that
-    # layout.  Old-gen/console materials assigned to a next-gen mesh are adapted
-    # non-destructively through fallback properties instead.
     if not _has_pc_nextgen_layout(material):
         return
     try:
@@ -863,10 +843,6 @@ def _patch_indices(blob: bytearray, parser: TRNextGenModelParser, header, prim_g
             material_obj = material_by_index.get(int(group.material_index))
             double_sided = _pc_nextgen_material_double_sided(material_obj)
             if double_sided:
-                # Blender import may have normal-oriented the reverse half of a
-                # double-wound pair, leaving two polygons with the same winding.
-                # Rebuild the face-data pair explicitly instead of trusting the
-                # mesh polygon winding verbatim.
                 selected = _select_double_sided_triangles(available[start:], needed)
                 if needed >= 2 and _count_double_wound_pairs(selected) <= 0:
                     _warn(
@@ -1319,14 +1295,6 @@ def _pc_nextgen_layer_images_from_nodes(material) -> list[object | None]:
 
 
 def _resolved_pc_nextgen_layer_texture_ids(material) -> list[int]:
-    """Resolve exported texture IDs from bound image nodes plus panel metadata.
-
-    The PC Next Gen panel remains the fallback/source for non-node workflows, but
-    an actually bound Image Texture node with a valid `trlau_texture_id` or a
-    parseable texture section ID now wins for its layer.  This means Base Color,
-    Normal Map, and Specular node swaps export without requiring manual texture
-    ID edits in the panel.
-    """
     _pc_nextgen_maybe_sync_material(material)
     ids = _csv_ints(_material_prop(material, 'trlau_pc_nextgen_layer_texture_ids', ''), 8, -1)
     images = _pc_nextgen_layer_images_from_nodes(material)
@@ -1370,7 +1338,6 @@ def _pc_nextgen_template_pixmaps(template_path: Path | None) -> list[int]:
 
 
 def _pc_nextgen_original_layer_texture_indices(material) -> list[int]:
-    """Return the imported per-layer textureIndex values when available."""
     template = _pc_nextgen_material_template_record_bytes(material)
     result = [0xFFFF] * 8
     if template is not None and len(template) >= _PC_NEXTGEN_MATERIAL_STRIDE:
@@ -1581,9 +1548,6 @@ def _pack_pc_nextgen_vertex_record(position: Vector, normal, uv: tuple[float, fl
     struct.pack_into('<f', data, 36, max(0.0, min(1.0, second_weight)))
     struct.pack_into('<hh', data, 40, int(local0), int(local1))
     if include_tangent_basis:
-        # Conservative tangent/binormal basis.  Tangents are currently not
-        # exposed in the Blender import path, so write a stable orthogonal
-        # fallback rather than carrying arbitrary stale template bytes.
         struct.pack_into('<fff', data, 44, 1.0, 0.0, 0.0)
         struct.pack_into('<fff', data, 56, 0.0, 1.0, 0.0)
     return bytes(data)
@@ -1613,14 +1577,6 @@ def _pc_nextgen_vertex_elements_blob(*, include_tangent_basis: bool = True) -> b
 
 
 def _pc_nextgen_material_uses_compact_vertex_layout(material) -> bool:
-    """Return true for materials that use the 44-byte alpha vertex stream.
-
-    Vanilla TR7 PC next-gen alpha/diffuse-only batches omit tangent and binormal
-    elements and use vertexFormat 0x003F, stride 44.  The supplied sample's
-    alpha material is one of those.  Rebuilding it with the normal-mapped
-    0xC03F/68-byte declaration makes the batch incompatible with the preserved
-    alpha shader mapping.
-    """
     try:
         return int(_material_prop(material, 'trlau_pc_nextgen_blend_mode', 0)) != 0 and _pc_nextgen_export_layer_count(material) <= 1
     except Exception:
@@ -1646,19 +1602,10 @@ def _pc_nextgen_export_layer_count(material) -> int:
 def _pc_nextgen_safe_material_flags(material) -> int:
     raw = _safe_int(_material_prop(material, 'trlau_pc_nextgen_material_flags', 0), 0) & 0xFFFFFFFF
     layer_count = _pc_nextgen_export_layer_count(material)
-    # Vanilla TR7 PC PCD9 diffuse-only alpha materials use the plain diffuse
-    # flag set (0x00221A00).  If a material was converted or duplicated from a
-    # layered/specular material and later reduced to one active layer, keeping
-    # flags such as 0x00235A00 makes the game bind a shader state that ignores
-    # the diffuse texture alpha; transparent white RGB then renders visibly
-    # in-game.  Normalize one-layer exports to the observed diffuse-only state.
     if layer_count <= 1:
         return _PC_NEXTGEN_DEFAULT_MATERIAL_FLAGS
     if raw != 0:
         return int(raw)
-    # Zero appears in newly converted placeholder materials, not in the vanilla
-    # TR7 PC Next-Gen material set we have.  Use a conservative lit material
-    # configuration instead of exporting a zeroed shader-control word.
     return _PC_NEXTGEN_DEFAULT_MATERIAL_FLAGS_SPECULAR if layer_count >= 3 else _PC_NEXTGEN_DEFAULT_MATERIAL_FLAGS
 
 
@@ -1666,12 +1613,6 @@ def _pc_nextgen_safe_shader_indices(material, shader_table_count: int | None = N
     values = _csv_ints(_material_prop(material, 'trlau_pc_nextgen_shader_indices', ''), 8, 0)
     layer_count = _pc_nextgen_export_layer_count(material)
 
-    # Imported PCD9 materials already contain the shader-program mapping used by
-    # the game.  Preserve that mapping on a rebuilt export instead of replacing
-    # every one-layer material with the generic diffuse-only fallback.  The
-    # alpha/eyelash material in the supplied sample uses shader indices
-    # 10..15; changing those to 7..12 pairs the material with the wrong vertex
-    # declaration and can crash during render-data setup.
     has_imported_record = _pc_nextgen_material_template_record_bytes(material) is not None
     has_explicit_mapping = any(int(value) != 0 for value in values[:6])
     if not has_imported_record and not has_explicit_mapping:
@@ -1690,13 +1631,6 @@ def _pc_nextgen_safe_shader_indices(material, shader_table_count: int | None = N
 
 
 def _pc_nextgen_material_template_record_bytes(material) -> bytes | None:
-    """Return the imported 456-byte PCMaterialData record when available.
-
-    Starting from the original material record preserves currently unknown
-    per-material bytes.  This is especially important for alpha-blended
-    vanilla materials: the documented fields can look sufficient, but the game
-    appears to depend on bytes we had been zeroing during generic rebuilds.
-    """
     value = _material_prop(material, 'trlau_pc_nextgen_material_record_hex', '')
     if isinstance(value, str):
         text = value.strip()
@@ -1818,10 +1752,6 @@ class _GeneratedPrimGroup:
         self.material_index = int(material_index)
         self.triangles: list[tuple[int, int, int]] = []
         self.index_base = 0
-        # For PC Next-Gen Double Sided materials, the mesh may already contain
-        # both windings from the imported face data.  Track each logical
-        # triangle so the generic writer emits one front/back pair, not a new
-        # pair for every already-duplicated Blender polygon.
         self.double_sided_keys: set[tuple[int, int, int]] = set()
 
 
@@ -1882,12 +1812,6 @@ def _append_group_triangle(batch: _GeneratedBatch, material_index: int, tri: tup
     if len(set(tri3)) != 3:
         return
     if double_sided:
-        # Imported PC Next-Gen files can already contain explicit double-wound
-        # faces.  Earlier generic-writer builds appended a reverse face for
-        # every Blender polygon, so an imported double-wound pair became four
-        # triangles on export.  Alpha-blended materials are especially sensitive
-        # to that overdraw and render white/opaque in game.  Emit exactly one
-        # front/back pair per unique logical triangle instead.
         key = tuple(sorted(tri3))
         if key in group.double_sided_keys:
             return
@@ -1958,9 +1882,6 @@ def _build_generated_nextgen_batches(mesh_obj, arm_obj) -> list[_GeneratedBatch]
                 continue
             triangle_bones = _triangle_skin_bones(vertex_payloads)
             if len(triangle_bones) > _PC_NEXTGEN_MAX_SKIN_MAP_SIZE:
-                # This should be practically unreachable because the exporter only
-                # writes the two strongest influences per vertex, but keep a clear
-                # error instead of silently truncating the PCModelBatch skin map.
                 raise ValueError(
                     f'PC Next Gen triangle needs {len(triangle_bones)} unique bones, exceeding the PCModelBatch skin map limit of {_PC_NEXTGEN_MAX_SKIN_MAP_SIZE}.'
                 )
@@ -1974,9 +1895,6 @@ def _build_generated_nextgen_batches(mesh_obj, arm_obj) -> list[_GeneratedBatch]
             elif current_batch is None:
                 current_batch = new_batch(include_tangent_basis=include_tangent_basis)
 
-            # If the current empty batch still cannot accept the triangle, fail
-            # explicitly.  That means a single triangle exceeded a hard format
-            # constraint and no amount of batch splitting can repair it.
             if not _can_add_triangle_to_batch(current_batch, needed_keys, vertex_payloads):
                 current_batch = new_batch(include_tangent_basis=include_tangent_basis)
                 if not _can_add_triangle_to_batch(current_batch, needed_keys, vertex_payloads):
@@ -2026,16 +1944,6 @@ def _build_generated_nextgen_batches(mesh_obj, arm_obj) -> list[_GeneratedBatch]
 
 
 def _pc_nextgen_bone_table_from_template(template_path: Path | None) -> list[int]:
-    """Read the global PCModelData bone table from a source next-gen section.
-
-    The PC batch skin maps used by TR7 PC are stored as the values consumed by
-    the runtime vertex palette.  In vanilla files the global bone table for Lara
-    is identity (0..108).  Rebuilding it as a compact "used bone" list makes
-    otherwise-valid skin-map entries point at the wrong global bones in game,
-    producing long spiked/skinned triangles.  Preserve the template table when
-    available; otherwise generate an identity table large enough for the skin
-    map entries we write.
-    """
     if template_path is None:
         return []
     path = Path(template_path)
@@ -2116,15 +2024,6 @@ def _pack_pc_nextgen_generic_payload(mesh_obj, arm_obj, render_id: int, *, templ
     num_indices = (index_cursor - index_offset) // 2
     prim_group_offset = _align(index_cursor, 16)
     prim_group_size = int(num_prim_groups) * 20
-    # Vanilla TR7 PC next-gen sections keep the auxiliary counted tables after
-    # the PCModelData block in this order:
-    #   specialMaterialFlags -> pixMaps -> shaders
-    # and PCModelData.totalDataSize points to the start of the special-material
-    # table, not to the physical end of the section.  Earlier generic-writer
-    # builds placed pixMaps first and wrote totalDataSize as the full section
-    # size.  The rebuilt payload could parse in our tools, but the game can use
-    # totalDataSize/table ordering when setting up render data, so write the
-    # vanilla layout here.
     pc_model_data_end = _align(prim_group_offset + prim_group_size, 16)
     special_flags_offset = pc_model_data_end
     special_flags: list[int] = []
@@ -2140,9 +2039,6 @@ def _pack_pc_nextgen_generic_payload(mesh_obj, arm_obj, render_id: int, *, templ
     pc_model_total_data_size = pc_base + special_flags_offset
     data = bytearray(pc_base + total_pc_size)
 
-    # nextGenSpecificData offsets are relative to the section data start.  The
-    # PCModelData field keeps the observed 0x0C raw value with a self relocation,
-    # while the parser/game reaches the PCD9 block at data+0x10.
     struct.pack_into('<IIII', data, 0, 0x0C, pc_base + pixmap_table_offset, pc_base + shaders_offset, pc_base + special_flags_offset)
 
     # Header.
@@ -2178,13 +2074,6 @@ def _pack_pc_nextgen_generic_payload(mesh_obj, arm_obj, render_id: int, *, templ
         boff = pc_base + batch_offset + batch_index * 0xAC
         if len(batch.skin_map) > _PC_NEXTGEN_MAX_SKIN_MAP_SIZE:
             raise ValueError(f'Generated PC Next Gen batch {batch_index} has skin map size {len(batch.skin_map)}; maximum is {_PC_NEXTGEN_MAX_SKIN_MAP_SIZE}.')
-        # PCModelBatch.flags is not a skinning flag.  Vanilla TR7 PC Next-Gen
-        # Lara uses flags=1 for fully opaque batches, but flags=0 for batches
-        # that contain alpha/blended primitive groups.  Earlier generic writer
-        # builds derived this from whether vertices had bone weights, so alpha
-        # materials were exported in flags=1 batches.  The game then rendered
-        # diffuse alpha incorrectly, exposing the white RGB in transparent pixels
-        # on eyelashes/hair.  Match the observed vanilla rule instead.
         batch_has_alpha_material = False
         for group in batch.groups:
             try:

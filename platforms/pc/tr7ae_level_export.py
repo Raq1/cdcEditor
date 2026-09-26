@@ -8,11 +8,21 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ...core.game_utils import normalize_game_value
+from ...core.log import logger
+
+def _int_or(value, default=0):
+    try:
+        return int(default) if value is None else int(value)
+    except Exception:
+        return int(default)
+
 
 _LEVEL_VERSION = 0x04C204BB
 _UV_SCALE = 0.00024414062
 _RELOCATION_POINTER = 0
 _ROOT_HEADER_SIZE = 0x130
+# Root fields that point to runtime combat data not yet represented by the editor.
+_ROOT_OPAQUE_COMBAT_POINTER_OFFSETS = (0xC4, 0xC8, 0xCC)  # attackWaveList, attackWaveGroupList, combatDoorsList
 _TERRAIN_HEADER_SIZE = 0x6C
 _GROUP_ENTRY_SIZE = 176
 _COLLISION_HEADER_SIZE = 78
@@ -368,6 +378,7 @@ class ExportPassthroughSection:
     has_debug_info: int = 0
     resource_type: int = 0
     spec_mask: int = 0xFFFFFFFF
+    original_section_index: int = -1
     relocations: List[Tuple[int, int, int]] = field(default_factory=list)
     pointer_relocations: List[Tuple[int, str, int]] = field(default_factory=list)
 
@@ -397,6 +408,7 @@ class ExportLevel:
     metadata: Dict[str, object] = field(default_factory=dict)
     unit_data: Optional[Dict[str, object]] = None
     admd_data: Optional[Dict[str, object]] = None
+    combat_data: Optional[Dict[str, object]] = None
     scene_center_offset: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     passthrough_sections: List[ExportPassthroughSection] = field(default_factory=list)
     game: str = 'legend'
@@ -423,6 +435,8 @@ class _PendingRelocation:
     source_offset: int
     target_section_name: str
     target_offset: int
+    relocation_type: int = _RELOCATION_POINTER
+    type_specific: int = 0
 
 
 class _SectionBuffer:
@@ -438,6 +452,7 @@ class _SectionBuffer:
         resource_type: int = 0,
         spec_mask: int = 0xFFFFFFFF,
         raw_relocations: Optional[List[Tuple[int, int, int]]] = None,
+        original_section_index: int = -1,
     ):
         self.name = name
         self.section_type = int(section_type)
@@ -447,6 +462,7 @@ class _SectionBuffer:
         self.has_debug_info = int(has_debug_info)
         self.resource_type = int(resource_type)
         self.spec_mask = int(spec_mask)
+        self.original_section_index = int(original_section_index)
         self.data = bytearray()
         self.relocations: List[_PendingRelocation] = []
         self.raw_relocations: Optional[List[Tuple[int, int, int]]] = list(raw_relocations) if raw_relocations is not None else None
@@ -473,9 +489,26 @@ class _SectionBuffer:
     def pack_at(self, offset: int, fmt: str, *values) -> None:
         struct.pack_into(fmt, self.data, int(offset), *values)
 
-    def write_pointer_at(self, offset: int, target_section_name: str, target_offset: int) -> None:
+    def write_relocation_at(
+        self,
+        offset: int,
+        target_section_name: str,
+        target_offset: int,
+        *,
+        relocation_type: int = _RELOCATION_POINTER,
+        type_specific: int = 0,
+    ) -> None:
         self.pack_at(offset, '<I', int(target_offset))
-        self.relocations.append(_PendingRelocation(int(offset), str(target_section_name), int(target_offset)))
+        self.relocations.append(_PendingRelocation(
+            int(offset),
+            str(target_section_name),
+            int(target_offset),
+            int(relocation_type) & 0x7,
+            int(type_specific),
+        ))
+
+    def write_pointer_at(self, offset: int, target_section_name: str, target_offset: int) -> None:
+        self.write_relocation_at(offset, target_section_name, target_offset)
 
 
 class TRLevelDRMWriter:
@@ -486,8 +519,383 @@ class TRLevelDRMWriter:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
 
+    @staticmethod
+    def _read_source_drm_sections(filepath: Path) -> Optional[List[dict[str, object]]]:
+        try:
+            raw = filepath.read_bytes()
+            if len(raw) < 8:
+                return None
+            _version, section_count = struct.unpack_from('<iI', raw, 0)
+            if section_count <= 0 or section_count > 65535:
+                return None
+            cursor = 8
+            sections: List[dict[str, object]] = []
+            for section_index in range(int(section_count)):
+                if cursor + 20 > len(raw):
+                    return None
+                size, section_type, skip_flags, version_id, packed_data, section_id, spec_mask = struct.unpack_from('<IBBHIII', raw, cursor)
+                cursor += 20
+                sections.append({
+                    'index': int(section_index),
+                    'size': int(size),
+                    'section_type': int(section_type),
+                    'skip_flags': int(skip_flags),
+                    'version_id': int(version_id),
+                    'has_debug_info': int(packed_data & 0x1),
+                    'resource_type': int((packed_data >> 1) & 0x7F),
+                    'relocation_count': int(packed_data >> 8),
+                    'section_id': int(section_id),
+                    'spec_mask': int(spec_mask),
+                })
+            for section in sections:
+                relocations: List[Tuple[int, int, int]] = []
+                for _relocation_index in range(int(section['relocation_count'])):
+                    if cursor + 8 > len(raw):
+                        return None
+                    type_and_section_info, type_specific, source_offset = struct.unpack_from('<HhI', raw, cursor)
+                    cursor += 8
+                    relocations.append((int(type_and_section_info), int(type_specific), int(source_offset)))
+                section_size = int(section['size'])
+                if section_size < 0 or cursor + section_size > len(raw):
+                    return None
+                section['relocations'] = relocations
+                section['data'] = bytes(raw[cursor:cursor + section_size])
+                cursor += section_size
+            return sections
+        except Exception:
+            return None
+
+    def _write_embedded_root_combat_data(self, root: _SectionBuffer, level: ExportLevel) -> List[_SectionBuffer]:
+        graph = dict(getattr(level, 'combat_data', {}) or {})
+        root_fields = list(graph.get('root_fields', []) or [])
+        if not root_fields:
+            return []
+
+        original_root_data = bytearray(root.data)
+        original_root_relocations = list(root.relocations)
+        original_root_raw_relocations = list(root.raw_relocations) if root.raw_relocations is not None else None
+
+        tail_start = _int_or(graph.get('root_tail_start'), -1)
+        tail_data_value = graph.get('root_tail_data', b'')
+        tail_data = bytes(tail_data_value) if isinstance(tail_data_value, (bytes, bytearray, memoryview)) else b''
+        root_tail_relocations = list(graph.get('root_tail_relocations', []) or [])
+        embedded_sections = list(graph.get('sections', []) or [])
+
+        new_tail_start: Optional[int] = None
+        if tail_start >= 0 and tail_data:
+            new_tail_start = root.append(tail_data, alignment=16)
+
+        copied_sections: dict[int, _SectionBuffer] = {}
+        for source_section in embedded_sections:
+            try:
+                source_index = _int_or(source_section.get('source_index'), -1)
+            except Exception:
+                continue
+            if source_index <= 0:
+                continue
+            section_name = f'embedded_combat_{source_index:04d}'
+            copied = _SectionBuffer(
+                section_name,
+                section_type=_int_or(source_section.get('section_type'), 0),
+                section_id=_int_or(source_section.get('section_id'), 0),
+                skip_flags=_int_or(source_section.get('skip_flags'), 0),
+                version_id=_int_or(source_section.get('version_id'), 0),
+                has_debug_info=_int_or(source_section.get('has_debug_info'), 0),
+                resource_type=_int_or(source_section.get('resource_type'), 0),
+                spec_mask=_int_or(source_section.get('spec_mask'), 0xFFFFFFFF),
+            )
+            payload = source_section.get('data', b'')
+            copied.data = bytearray(bytes(payload) if isinstance(payload, (bytes, bytearray, memoryview)) else b'')
+            copied_sections[source_index] = copied
+
+        def mapped_target(target_section_index: int, target_offset: int) -> Tuple[str, int]:
+            target_section_index = int(target_section_index)
+            target_offset = int(target_offset)
+            if target_section_index == 0:
+                if new_tail_start is None or tail_start < 0 or target_offset < tail_start:
+                    raise ValueError('embedded combat data points outside its stored root tail')
+                return root.name, int(new_tail_start + (target_offset - tail_start))
+            copied = copied_sections.get(target_section_index)
+            if copied is None:
+                raise ValueError(f'embedded combat data is missing section {target_section_index}')
+            return copied.name, target_offset
+
+        try:
+            if new_tail_start is not None:
+                for relocation in root_tail_relocations:
+                    source_offset = _int_or(relocation.get('source_offset'), -1)
+                    if source_offset < tail_start:
+                        continue
+                    target_name, target_offset = mapped_target(
+                        _int_or(relocation.get('target_section'), -1),
+                        _int_or(relocation.get('target_offset'), 0),
+                    )
+                    root.write_relocation_at(
+                        int(new_tail_start + (source_offset - tail_start)),
+                        target_name,
+                        target_offset,
+                        relocation_type=_int_or(relocation.get('relocation_type'), 0),
+                        type_specific=_int_or(relocation.get('type_specific'), 0),
+                    )
+
+            section_by_source_index = {
+                _int_or(section.get('source_index'), -1): section
+                for section in embedded_sections
+                if _int_or(section.get('source_index'), -1) > 0
+            }
+            for source_index, copied in copied_sections.items():
+                source_section = section_by_source_index.get(source_index, {})
+                for relocation in list(source_section.get('relocations', []) or []):
+                    source_offset = _int_or(relocation.get('source_offset'), -1)
+                    if source_offset < 0 or source_offset + 4 > len(copied.data):
+                        continue
+                    target_name, target_offset = mapped_target(
+                        _int_or(relocation.get('target_section'), -1),
+                        _int_or(relocation.get('target_offset'), 0),
+                    )
+                    copied.write_relocation_at(
+                        source_offset,
+                        target_name,
+                        target_offset,
+                        relocation_type=_int_or(relocation.get('relocation_type'), 0),
+                        type_specific=_int_or(relocation.get('type_specific'), 0),
+                    )
+
+            combat_field_offsets = {_int_or(field.get('field_offset'), -1) for field in root_fields}
+            root.relocations = [
+                relocation for relocation in root.relocations
+                if int(relocation.source_offset) not in combat_field_offsets
+            ]
+            for field in root_fields:
+                field_offset = _int_or(field.get('field_offset'), -1)
+                if field_offset < 0 or field_offset + 4 > len(root.data):
+                    continue
+                target_name, target_offset = mapped_target(
+                    _int_or(field.get('target_section'), -1),
+                    _int_or(field.get('target_offset'), 0),
+                )
+                root.write_relocation_at(
+                    field_offset,
+                    target_name,
+                    target_offset,
+                    relocation_type=_int_or(field.get('relocation_type'), 0),
+                    type_specific=_int_or(field.get('type_specific'), 0),
+                )
+        except Exception as exc:
+            root.data = original_root_data
+            root.relocations = original_root_relocations
+            root.raw_relocations = original_root_raw_relocations
+            logger.error('Could not rebuild embedded combat data: %s', exc)
+            raise ValueError(f'Could not rebuild embedded combat data: {exc}') from exc
+
+        logger.info(
+            'Rebuilt embedded combat data from Blender properties (root tail bytes=%d, dependent sections=%d)',
+            len(tail_data),
+            len(copied_sections),
+        )
+        return [copied_sections[index] for index in sorted(copied_sections)]
+
+    def _preserve_source_root_combat_data(self, root: _SectionBuffer, level: ExportLevel) -> List[_SectionBuffer]:
+        metadata = dict(getattr(level, 'metadata', {}) or {})
+        source_path_text = str(metadata.get('source_path', '') or '').strip()
+        if not source_path_text:
+            return []
+        source_path = Path(source_path_text).expanduser()
+        if not source_path.is_file():
+            return []
+
+        source_sections = self._read_source_drm_sections(source_path)
+        if not source_sections:
+            logger.warning('Could not read source DRM combat data from %s', source_path)
+            return []
+        source_root = source_sections[0]
+        source_root_data = bytes(source_root.get('data', b'') or b'')
+        source_root_relocations = list(source_root.get('relocations', []) or [])
+        if len(source_root_data) < _ROOT_HEADER_SIZE:
+            return []
+
+        relocation_by_offset = {int(entry[2]): entry for entry in source_root_relocations}
+        root_field_targets: List[Tuple[int, int, int, int, int]] = []
+        local_targets: List[int] = []
+        for field_offset in _ROOT_OPAQUE_COMBAT_POINTER_OFFSETS:
+            if field_offset + 4 > len(source_root_data):
+                continue
+            raw_target = int(struct.unpack_from('<I', source_root_data, field_offset)[0])
+            relocation = relocation_by_offset.get(int(field_offset))
+            if raw_target <= 0 or relocation is None:
+                continue
+            type_and_section_info, type_specific, _source_offset = relocation
+            target_section_index = int(type_and_section_info) >> 3
+            relocation_type = int(type_and_section_info) & 0x7
+            if target_section_index < 0 or target_section_index >= len(source_sections):
+                return []
+            root_field_targets.append((
+                int(field_offset),
+                int(target_section_index),
+                int(raw_target),
+                int(relocation_type),
+                int(type_specific),
+            ))
+            if target_section_index == 0:
+                local_targets.append(int(raw_target))
+
+        if not root_field_targets or not local_targets:
+            return []
+        tail_start = min(local_targets)
+        if tail_start < _ROOT_HEADER_SIZE or tail_start >= len(source_root_data):
+            return []
+
+        tail_relocations = [entry for entry in source_root_relocations if int(entry[2]) >= tail_start]
+        external_section_indices: set[int] = set()
+
+        def _raw_relocation_target(section: dict[str, object], source_offset: int) -> int:
+            section_data = bytes(section.get('data', b'') or b'')
+            if source_offset < 0 or source_offset + 4 > len(section_data):
+                raise ValueError('relocation source offset is outside its section')
+            return int(struct.unpack_from('<I', section_data, source_offset)[0])
+
+        for type_and_section_info, _type_specific, source_offset in tail_relocations:
+            target_section_index = int(type_and_section_info) >> 3
+            raw_target = _raw_relocation_target(source_root, int(source_offset))
+            if target_section_index == 0:
+                if raw_target < tail_start or raw_target >= len(source_root_data):
+                    logger.warning('Source DRM combat tail is not self-contained; combat data was not preserved')
+                    return []
+            else:
+                if target_section_index < 0 or target_section_index >= len(source_sections):
+                    return []
+                external_section_indices.add(int(target_section_index))
+
+        visiting: set[int] = set()
+        visited: set[int] = set()
+        external_order: List[int] = []
+
+        def _collect_external(section_index: int) -> None:
+            if section_index == 0 or section_index in visited:
+                return
+            if section_index in visiting:
+                return
+            if section_index < 0 or section_index >= len(source_sections):
+                raise ValueError('source relocation targets an invalid section')
+            visiting.add(section_index)
+            section = source_sections[section_index]
+            for type_and_section_info, _type_specific, source_offset in list(section.get('relocations', []) or []):
+                target_section_index = int(type_and_section_info) >> 3
+                raw_target = _raw_relocation_target(section, int(source_offset))
+                if target_section_index == 0:
+                    if raw_target < tail_start or raw_target >= len(source_root_data):
+                        raise ValueError('external combat section points outside the preserved root tail')
+                else:
+                    _collect_external(int(target_section_index))
+            visiting.remove(section_index)
+            visited.add(section_index)
+            external_order.append(section_index)
+
+        try:
+            for section_index in sorted(external_section_indices):
+                _collect_external(section_index)
+        except Exception as exc:
+            logger.warning('Could not preserve source DRM combat dependencies: %s', exc)
+            return []
+
+        new_tail_start = root.align(16)
+        root.data.extend(source_root_data[tail_start:])
+
+        copied_sections: dict[int, _SectionBuffer] = {}
+        for section_index in external_order:
+            source_section = source_sections[section_index]
+            section_name = f'source_combat_{section_index:04d}'
+            copied = _SectionBuffer(
+                section_name,
+                section_type=int(source_section.get('section_type', 0)),
+                section_id=int(source_section.get('section_id', 0)),
+                skip_flags=int(source_section.get('skip_flags', 0)),
+                version_id=int(source_section.get('version_id', 0)),
+                has_debug_info=int(source_section.get('has_debug_info', 0)),
+                resource_type=int(source_section.get('resource_type', 0)),
+                spec_mask=int(source_section.get('spec_mask', 0xFFFFFFFF)),
+            )
+            copied.data = bytearray(bytes(source_section.get('data', b'') or b''))
+            copied_sections[section_index] = copied
+
+        def _mapped_target(target_section_index: int, raw_target: int) -> Tuple[str, int]:
+            if target_section_index == 0:
+                return root.name, int(new_tail_start + (int(raw_target) - tail_start))
+            copied = copied_sections.get(int(target_section_index))
+            if copied is None:
+                raise ValueError('missing copied combat dependency section')
+            return copied.name, int(raw_target)
+
+        for type_and_section_info, type_specific, source_offset in tail_relocations:
+            source_offset = int(source_offset)
+            target_section_index = int(type_and_section_info) >> 3
+            relocation_type = int(type_and_section_info) & 0x7
+            raw_target = _raw_relocation_target(source_root, source_offset)
+            target_name, target_offset = _mapped_target(target_section_index, raw_target)
+            root.write_relocation_at(
+                int(new_tail_start + (source_offset - tail_start)),
+                target_name,
+                target_offset,
+                relocation_type=relocation_type,
+                type_specific=int(type_specific),
+            )
+
+        for section_index in external_order:
+            source_section = source_sections[section_index]
+            copied = copied_sections[section_index]
+            for type_and_section_info, type_specific, source_offset in list(source_section.get('relocations', []) or []):
+                source_offset = int(source_offset)
+                target_section_index = int(type_and_section_info) >> 3
+                relocation_type = int(type_and_section_info) & 0x7
+                raw_target = _raw_relocation_target(source_section, source_offset)
+                target_name, target_offset = _mapped_target(target_section_index, raw_target)
+                copied.write_relocation_at(
+                    source_offset,
+                    target_name,
+                    target_offset,
+                    relocation_type=relocation_type,
+                    type_specific=int(type_specific),
+                )
+
+        opaque_field_offsets = {int(field_offset) for field_offset, *_rest in root_field_targets}
+        root.relocations = [
+            relocation for relocation in root.relocations
+            if int(relocation.source_offset) not in opaque_field_offsets
+        ]
+        for field_offset, target_section_index, raw_target, relocation_type, type_specific in root_field_targets:
+            target_name, target_offset = _mapped_target(target_section_index, raw_target)
+            root.write_relocation_at(
+                field_offset,
+                target_name,
+                target_offset,
+                relocation_type=relocation_type,
+                type_specific=type_specific,
+            )
+
+        logger.info(
+            'Preserved source combat runtime data from %s (root tail 0x%X..0x%X, %d dependent section(s))',
+            source_path.name,
+            tail_start,
+            len(source_root_data),
+            len(copied_sections),
+        )
+        return [copied_sections[index] for index in external_order]
+
     def _build_drm(self, sections: Sequence[_SectionBuffer]) -> bytes:
         section_index_by_name = {section.name: index for index, section in enumerate(sections)}
+
+        source_index_to_output_index: Dict[int, int] = {0: 0}
+        for output_index, section in enumerate(sections):
+            source_index = int(getattr(section, 'original_section_index', -1))
+            if source_index < 0:
+                continue
+            previous = source_index_to_output_index.get(source_index)
+            if previous is not None and int(previous) != int(output_index):
+                raise ValueError(
+                    f'Duplicate passthrough source section index {source_index}: '
+                    f'output sections {previous} and {output_index}'
+                )
+            source_index_to_output_index[source_index] = int(output_index)
 
         payload = bytearray()
         payload.extend(struct.pack('<iI', _SECTION_VERSION, len(sections)))
@@ -515,11 +923,28 @@ class TRLevelDRMWriter:
             if raw_relocations:
                 raw_relocations.sort(key=lambda entry: int(entry[2]))
                 for type_and_section_info, type_specific, offset in raw_relocations:
-                    payload.extend(struct.pack('<HhI', int(type_and_section_info) & 0xFFFF, int(type_specific), int(offset)))
+                    raw_type_and_section = int(type_and_section_info) & 0xFFFF
+                    relocation_type = raw_type_and_section & 0x7
+                    source_target_index = (raw_type_and_section >> 3) & 0x1FFF
+                    output_target_index = source_index_to_output_index.get(source_target_index)
+                    if output_target_index is not None:
+                        raw_type_and_section = ((int(output_target_index) & 0x1FFF) << 3) | relocation_type
+                    elif source_target_index >= len(sections):
+                        raise ValueError(
+                            f'Raw relocation in output section {section.name!r} at 0x{int(offset):X} '
+                            f'targets missing source section {source_target_index}. '
+                            f'Re-import the level with a version that records passthrough section indices.'
+                        )
+                    payload.extend(struct.pack('<HhI', raw_type_and_section, int(type_specific), int(offset)))
             else:
                 for relocation in section.relocations:
                     target_index = section_index_by_name[relocation.target_section_name]
-                    payload.extend(struct.pack('<HhI', (target_index << 3) | _RELOCATION_POINTER, 0, relocation.source_offset))
+                    payload.extend(struct.pack(
+                        '<HhI',
+                        (target_index << 3) | (int(relocation.relocation_type) & 0x7),
+                        int(relocation.type_specific),
+                        relocation.source_offset,
+                    ))
             payload.extend(section.data)
 
         return bytes(payload)
@@ -747,6 +1172,11 @@ class TRLevelDRMWriter:
                 collision_offset=collision_offsets.get(int(group.index), 0),
             )
 
+        source_combat_sections = self._write_embedded_root_combat_data(root, level)
+        if not source_combat_sections and not getattr(level, 'combat_data', None):
+            # Backward compatibility for .blend files imported before embedded combat metadata existed.
+            source_combat_sections = self._preserve_source_root_combat_data(root, level)
+
         sections: List[_SectionBuffer] = [root, terrain, terrain_nulls]
         if intro_data_section is not None:
             sections.append(intro_data_section)
@@ -773,6 +1203,7 @@ class TRLevelDRMWriter:
                 resource_type=int(passthrough.resource_type),
                 spec_mask=int(passthrough.spec_mask),
                 raw_relocations=None if pointer_relocations else list(passthrough.relocations or []),
+                original_section_index=int(getattr(passthrough, 'original_section_index', -1)),
             )
             passthrough_section.data = bytearray(bytes(passthrough.data or b''))
             for source_offset, target_section_name, target_offset in pointer_relocations:
@@ -782,6 +1213,7 @@ class TRLevelDRMWriter:
                     int(target_offset),
                 )
             sections.append(passthrough_section)
+        sections.extend(source_combat_sections)
         return sections
 
     @staticmethod
@@ -1075,8 +1507,8 @@ class TRLevelDRMWriter:
                 next_field_offset = offset + int(_ATTACK_WAVE_RUNTIME_NEXT_POINTER_OFFSETS.get(chain_name, 24))
                 section.write_pointer_at(next_field_offset, section.name, offsets[index + 1])
             self._write_signal_move_pos_limits_at(section, offset + 36, wave)
-            self._write_attack_wave_messages_at(section, offset + 748, wave)
-            section.pack_at(offset + 800, '<i', self._i32(wave.get('endMarker', 0)))
+            self._write_attack_wave_messages_at(section, offset + 744, wave)
+            section.pack_at(offset + 796, '<i', self._i32(wave.get('endMarker', 0)))
         return offsets[0]
 
     @staticmethod
@@ -1377,7 +1809,10 @@ class TRLevelDRMWriter:
                 runtime_area_dbase_offset = int(meta.get('areaDBaseRuntimeObjectOffset', -1))
             except Exception:
                 runtime_area_dbase_offset = -1
-            section.pack_at(root_offset + 240, '<I', 0)
+            if move_offset >= 0:
+                section.write_pointer_at(root_offset + 240, area_dbase_section, move_offset)
+            else:
+                section.pack_at(root_offset + 240, '<I', 0)
             if planner_offset < 0:
                 try:
                     planner_offset = int(meta.get('areaDBaseHeaderContentOffset', -1))
@@ -1529,13 +1964,6 @@ class TRLevelDRMWriter:
         self._pack_padded_vec3f(section, group_offset + 160, group.group_origin or group.position)
 
     def _get_sorted_material_order(self, group: ExportTerrainGroup) -> List[int]:
-        """Derive the sorted material table from exported strip content.
-
-        The original import stored this table as a custom property, but it is not
-        authored data.  Rebuild a stable order from the strips that will be
-        written: animated/scrolling materials first, then by texture page, flags,
-        and material index.
-        """
         count = max(0, len(group.strips))
         if count <= 0:
             return []

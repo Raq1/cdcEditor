@@ -60,10 +60,6 @@ def _standalone_relocation_table_plausible(br: BinaryReader, header_start: int, 
     if count == 0:
         return True
 
-    # PS3 standalone sections store the relocation count in the low 16 bits of
-    # packed_data.  Avoid mistaking unrelated big-endian formats for that layout
-    # by verifying that the candidate table is internally sane: relocation field
-    # offsets should point into the data payload that follows the table.
     data_size = max(0, int(file_size) - table_end)
     if data_size <= 0:
         return False
@@ -156,10 +152,6 @@ class TRSectionParser:
             )
             relocations.append(entry)
             relocations_by_offset[offset] = entry
-            # Do not log every relocation entry here. Large DRM containers can contain
-            # thousands of sections and relocation records, which makes the debug log
-            # unusable. Keep only the aggregate relocation count in the section-header
-            # message below and log individual relocation use at pointer-resolution sites.
 
         info_size = 0x18 + (num_relocations * 8)
         logger.debug(
@@ -244,9 +236,6 @@ class SectionContextCache:
         section_info = TRSectionParser.parse(br)
         file_size = path.stat().st_size
         data_start = section_offset + section_info.info_size
-        # SECT size stores payload/data length.  Older development exports
-        # incorrectly wrote total section length; keep a fallback so those files
-        # remain readable while matching the original game layout.
         data_end = data_start + section_info.size
         if data_end > file_size and section_offset + section_info.size <= file_size:
             data_end = section_offset + section_info.size

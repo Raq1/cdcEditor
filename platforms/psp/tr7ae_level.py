@@ -111,11 +111,6 @@ _PSP_LEVEL_UV_SCALE = 1.0 / 2048.0
 def _psp_level_uv_tile_base(raw_values: List[int]) -> int:
     if not raw_values:
         return 0
-    # PSP terrain strips store Q11 UVs and commonly put texture-edge values one
-    # LSB below the next integer tile, e.g. 0x3FFF and 0x47FF for a full 0..1
-    # span.  Add that LSB when selecting the integer tile origin so the decoded
-    # UVs land on the local texture square instead of importing as a half-size
-    # 12-bit fragment.
     return int(math.floor((float(min(int(v) for v in raw_values)) + 1.0) * _PSP_LEVEL_UV_SCALE))
 
 
@@ -167,11 +162,6 @@ def _psp_color_offset(blob_size: int) -> int:
 def _decode_psp_level_rgb565_vertex_color(value: int) -> Tuple[int, int, int, int]:
     value = int(value) & 0xFFFF
 
-    # PSP level terrain stores this word as RGB565 vertex lighting.  The upper
-    # five bits are the blue channel, not alpha/mask data.  Decoding them as
-    # alpha makes level vertex colors partly transparent and collapses the
-    # actual lighting down to a grayscale value.  This matches the PSP PCD
-    # RGB565 texture channel order used elsewhere in the importer.
     r5 = value & 0x001F
     g6 = (value >> 5) & 0x003F
     b5 = (value >> 11) & 0x001F
@@ -195,9 +185,6 @@ def _read_psp_vertex_color(blob: bytes) -> Optional[Tuple[int, int, int, int]]:
 def _psp_strip_vertex_key(level: LevelData, index: int) -> tuple:
     if 0 <= int(index) < len(level.vertices):
         pos = level.vertices[int(index)]
-        # Topology restarts/degenerates are position-based.  Some PSP terrain
-        # seam vertices duplicate xyz while changing UVs, so including UVs in
-        # this key lets artificial bridge triangles survive.
         return (
             round(float(pos[0]), 6), round(float(pos[1]), 6), round(float(pos[2]), 6),
         )
@@ -221,9 +208,6 @@ def _vec_dot(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> fl
 
 
 def _convert_psp_level_normal(nx: int, ny: int, nz: int) -> Tuple[float, float, float]:
-    # Terrain vertices use the same axis convention as their signed xyz shorts.
-    # _convert_level_position(x, y, z) is equivalent to (-x, -y, z), so use
-    # the same linear transform for byte-packed normals.
     return (-float(nx), -float(ny), float(nz))
 
 
@@ -262,9 +246,6 @@ def _looks_like_psp_strip_header(data: bytearray | bytes, offset: int, material_
     total_vertex_count = int(strip_vertex_count) + int(list_vertex_count)
     if total_vertex_count <= 0 or total_vertex_count > (_PSP_STRIP_MAX_VERTEX_COUNT * 2):
         return False
-    # Valid PSP terrain draw-strip records observed in TRA/TRL retail data use
-    # 0xFFFFFFFF as the third header word.  Pointer tables and material arrays
-    # can otherwise look like huge strips when only the first half-word is used.
     if _safe_u32(data, offset + 0x08) != 0xFFFFFFFF:
         return False
     mat = _safe_i32(data, offset + 0x18)
@@ -288,9 +269,6 @@ def _strip_to_triangles(
         index = int(raw_index)
         key = _psp_strip_vertex_key(level, index)
         if previous_key is not None and key == previous_key:
-            # PSP terrain chains use duplicated vertex records as strip-island
-            # separators.  Keep the duplicate as the first vertex of the new
-            # window so the next non-degenerate triangle starts locally.
             window = [index]
             previous_key = key
             continue
@@ -529,10 +507,6 @@ class TRPSPLevelParser(TRLevelParser):
             raise ValueError(f'PSP level terrain pointer is invalid: 0x{terrain_offset:08X}')
 
         level = LevelData(filepath=self.filepath)
-        # TRA PSP level roots use marker 0x04C204BB; TRL PSP level roots use
-        # 0x04C204BF.  The importer UI has historically passed an Anniversary
-        # hint for all PSP level DRMs, so prefer the root marker when selecting
-        # Legend-vs-Anniversary metadata layouts such as MarkUp entries.
         if int(level_magic) == _PSP_LEGEND_LEVEL_VERSION:
             level.source_game = 'legend'
         elif int(level_magic) == _PSP_ANNIVERSARY_LEVEL_VERSION:
@@ -553,11 +527,6 @@ class TRPSPLevelParser(TRLevelParser):
 
         self._read_psp_terrain(reader, sections, level, terrain_offset)
 
-        # The PSP DRM level root keeps the PC/LAU Level fields for MarkUp,
-        # camera metadata, terrain lights and IntroData.  The terrain payload is
-        # platform-specific, so it is parsed above, but the shared root metadata
-        # path can be reused after relocation has converted DRM pointers to
-        # absolute offsets.
         psp_metadata = dict(getattr(level, 'level_metadata', {}) or {})
         try:
             self._populate_drm_level_metadata(reader, sections, root_section, level)
@@ -727,12 +696,6 @@ class TRPSPLevelParser(TRLevelParser):
         if primitive_table <= 0 or not _in_range(data, primitive_table, _PSP_BGOBJECT_EXTRA_PRIMITIVE_SIZE):
             return primitives
 
-        # PSP BGObject primitive tables are a sequence of uniform 0x30-byte
-        # draw records followed by a small footer/terminator block.  The first
-        # v7 pass treated the first record as a 0x6C PC-like header and then
-        # read later records starting mid-entry; that mixed vertex counts and
-        # data pointers from different records, producing exploded BGObject
-        # meshes.
         table_end = int(geometry_start) if geometry_start > primitive_table else int(primitive_table) + _PSP_BGOBJECT_EXTRA_PRIMITIVE_SIZE
         table_end = min(max(0, table_end), len(data))
         current = int(primitive_table)
@@ -825,11 +788,6 @@ class TRPSPLevelParser(TRLevelParser):
             if len(blob) < 6:
                 continue
 
-            # PSP BGObject streams follow the model-style GE coordinate
-            # order, not the PSP terrain layout.  The compact 10-byte BGObject
-            # record is uv8x2, aux/color16, xyz16x3.  v8 decoded the first four
-            # bytes as signed uv16 fixed-point values, which produced wildly
-            # oversized UV islands.
             raw_x, raw_y, raw_z = struct.unpack_from('<3h', blob, len(blob) - 6)
             uv_offset = _psp_uv_offset(int(primitive.mode), len(blob))
             if uv_offset + 2 <= len(blob):
@@ -1092,12 +1050,6 @@ class TRPSPLevelParser(TRLevelParser):
 
     @staticmethod
     def _psp_stride_candidates(_mode: int = 0) -> List[int]:
-        # Retail PSP level terrain samples use a 0x38-byte strip header followed
-        # by 16-byte vertices.  Some strip headers have non-zero upper bits in
-        # the first word and leave auxiliary/padding bytes before the next strip;
-        # choosing the stride from the next-strip span turns those records into
-        # 18/20/22-byte vertices and corrupts positions/faces.  Keep the wider
-        # candidates for recovery, but strongly prefer the observed 16-byte path.
         return [16, 18, 20, 22, 14, 24, 12]
 
     def _choose_psp_strip_layout(self, data: bytearray, strip_offset: int, vertex_count: int, next_offset: int) -> Tuple[int, int]:
@@ -1167,12 +1119,6 @@ class TRPSPLevelParser(TRLevelParser):
             raw_uv: Optional[Tuple[int, int]] = None
             fallback_uv = (0.0, 0.0)
             if len(blob) >= 16:
-                # PSP level terrain uses a distinct compact 16-byte format:
-                #   uv16x2, color16, normal8x3, pad, xyz16x3
-                # The UV shorts are Q11 fixed-point texture coordinates.  Their
-                # integer tile part is local to this draw-strip and should not
-                # be kept as a PC-style 1/4096 coordinate or masked down to 12
-                # bits; both make full-tile PSP faces import too small.
                 raw_u = int(struct.unpack_from('<H', blob, 0)[0])
                 raw_v = int(struct.unpack_from('<H', blob, 2)[0])
                 raw_uv = (raw_u, raw_v)
@@ -1206,12 +1152,6 @@ class TRPSPLevelParser(TRLevelParser):
             strip_normals[int(source_index)] = normal
             sequence.append(source_index)
 
-        # The two 16-bit count fields are different primitive batches packed
-        # back-to-back: h0 is a triangle-strip vertex stream and h1 is an
-        # independent triangle-list vertex stream.  h1 is almost always a
-        # multiple of three and the record span is 0x38 + (h0 + h1) * 16.
-        # Treating h1 as strip continuation creates long diagonal artifacts;
-        # ignoring it leaves random holes.
         triangles: List[int] = []
         if strip_vertex_count > 0:
             triangles.extend(_strip_to_triangles(sequence[:strip_vertex_count], level, strip_normals))

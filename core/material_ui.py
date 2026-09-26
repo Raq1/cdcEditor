@@ -331,10 +331,6 @@ def _texture_id_mask_for_material(material) -> int:
 def get_material_tpageid(material) -> int:
     if _has_registered_material_panel_props(material):
         flags = _flags_from_panel_props(material)
-        # Export compatibility: material Type is an authoring layout, not a hard
-        # routing rule.  Old-gen meshes may use PC Next-Gen/console materials;
-        # collapse those layouts to the closest legacy tpage word at export time
-        # instead of requiring the user to convert the material first.
         try:
             if _is_pc_nextgen_material(material):
                 flags = _oldgen_tpage_flags_from_pc_nextgen_material(material, flags)
@@ -366,9 +362,6 @@ def _oldgen_tpage_flags_from_pc_nextgen_material(material, base_flags: Dict[str,
     if blend_mode == 1 or bool(render_flags & 0x200):
         flags['alpha_ref'] = 1
     if blend_mode != 0 or bool(render_flags & 0x200):
-        # Old PC tpage alpha/blend state is not a one-to-one match for PCD9.
-        # Use a simple non-zero blend value so the legacy material is not
-        # exported as fully opaque when sourced from a next-gen alpha material.
         flags['blend_value'] = int(flags.get('blend_value', 0) or 1)
     try:
         if bool(_pc_nextgen_panel_storage_value(material, 'trlau_pc_nextgen_double_sided', False)):
@@ -442,10 +435,6 @@ def _uses_console_render_flags(material_platform: str | None) -> bool:
 def _apply_console_cull_single_sided_rule(flags: Dict[str, int], material_platform: str = 'ps3') -> Dict[str, int]:
     adjusted = dict(flags)
     if _uses_console_render_flags(material_platform):
-        # On PS3/Xbox 360 the field previously shown as Cull Mode is not the
-        # PC cull-mode enum.  The observed value 2 is the console storage for
-        # Single Sided, while the PC bit-21 Single Sided field is not used for
-        # these material words.
         console_single_sided_value = int(adjusted.get('cull_mode', 0)) & 0x7
         adjusted['single_sided'] = 1 if console_single_sided_value == 2 else 0
         adjusted['cull_mode'] = 0
@@ -1465,13 +1454,6 @@ def _pc_nextgen_store_layer_image_names(material, layer_images) -> None:
 
 
 def _pc_nextgen_capture_current_layer_images(material) -> list[Optional[bpy.types.Image]]:
-    """Return current PC next-gen layer images before the node tree is rebuilt.
-
-    Live panel edits rebuild the material.  The imported textures may be packed
-    Blender images with no reliable filesystem path, so resolving only by
-    texture ID can lose the image bindings and turn the material white.  Capture
-    the existing layer nodes first and keep those images as fallbacks.
-    """
     images: list[Optional[bpy.types.Image]] = [None] * _PC_NEXTGEN_LAYER_COUNT
     if material is None:
         return images
@@ -1660,13 +1642,6 @@ def _pc_nextgen_json_from_float_tuples(values) -> str:
 
 
 def _pc_nextgen_panel_storage_value(material, name: str, default=None):
-    """Return PC Next Gen export/material data from registered panel properties.
-
-    New imports keep PCMaterialData in RNA panel properties instead of visible
-    Blender ID custom properties.  This adapter preserves the old
-    `trlau_pc_nextgen_*` storage names for internal callers while avoiding IDProp
-    writes on the material datablock.
-    """
     if material is None:
         return default
     try:
@@ -1791,15 +1766,6 @@ def _pc_nextgen_get_array_color(material, key: str, length: int, default=(1.0, 1
 
 
 def _pc_nextgen_panel_mismatches_imported_data(material) -> bool:
-    """Return True when RNA panel values still look like defaults/stale data.
-
-    Blender registered properties can be default-valued even when the material ID
-    properties already contain imported PCMaterialData.  Earlier builds also
-    wrote the panel-sync version before all UI fields were hydrated, causing the
-    panel to show -1/0.0 until any edit forced a full sync.  This guard compares
-    a few high-signal fields so the draw/update path can safely hydrate from the
-    imported data instead of preserving stale defaults.
-    """
     if material is None or not _is_pc_nextgen_material(material):
         return False
     checks: list[tuple[str, object, object]] = []
@@ -1832,11 +1798,6 @@ def _pc_nextgen_panel_mismatches_imported_data(material) -> bool:
 
 
 def ensure_pc_nextgen_material_panel_props(material, *, refresh_stale_defaults: bool = True) -> None:
-    """Populate registered panel properties from imported PCMaterialData metadata.
-
-    Existing v3 imports stored only custom properties; this migration makes the
-    new UI tab immediately usable without requiring the model to be re-imported.
-    """
     if material is None or not _is_pc_nextgen_material(material):
         return
     try:
@@ -2879,7 +2840,6 @@ def _material_specular_texture_id(material) -> int:
 
 
 def initialize_pc_nextgen_material_from_current(material) -> None:
-    """Create a usable PCMaterialData layout from the current material state."""
     if material is None:
         return
     diffuse_id = _clamp_texture_id(_material_primary_texture_id(material), allow_disabled=False)
@@ -2954,6 +2914,7 @@ def convert_material_to_type(material, material_type: str, owner=None) -> None:
     texture_id = _material_primary_texture_id(material)
     normal_id = _material_normal_texture_id(material)
     specular_id = _material_specular_texture_id(material)
+    draw_group = get_material_draw_group(material)
 
     previous_guard = _MATERIAL_SYNC_GUARD
     _MATERIAL_SYNC_GUARD = True
@@ -3059,9 +3020,6 @@ def _update_ps3_material_panel_settings(self, context):
 def _update_pc_nextgen_material_panel_settings(self, context):
     if _MATERIAL_SYNC_GUARD:
         return
-    # Ensure imported custom metadata has been copied to registered UI fields
-    # before any single live edit is synced back. Without this, the first update
-    # can write default layer values over the imported PCMaterialData table.
     ensure_pc_nextgen_material_panel_props(self, refresh_stale_defaults=False)
     _pc_nextgen_capture_current_layer_images(self)
     try:
@@ -3181,9 +3139,6 @@ def register_material_properties():
         name='TRLAU Role Mapping Version', default=4, options={'HIDDEN'},
     )
 
-    # PC Next Gen PCMaterialData panel fields.  These are registered properties
-    # so edits in the TRLAU panel can drive the shader rebuild callback in real
-    # time instead of sitting only in Blender custom-property metadata.
     bpy.types.Material.trlau_ui_pcng_material_record_offset = bpy.props.IntProperty(
         name='Material Record Offset', default=0, options={'HIDDEN'},
     )

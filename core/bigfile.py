@@ -87,12 +87,6 @@ def bigfile_first_specialization_suffix(spec_mask: int) -> str:
 
 
 def specialize_bigfile_record_path(path_text: str, spec_mask: int) -> str:
-    """Add a language/NextGen suffix using the first known specialization flag.
-
-    Bigfiles can contain multiple records with the same filename hash and different
-    specialization masks. Using the first known flag keeps multi-specialization
-    assets distinct in the UI and extraction output without making long filenames.
-    """
     path_text = str(path_text or '')
     suffix = bigfile_first_specialization_suffix(spec_mask)
     if not suffix:
@@ -265,15 +259,6 @@ def load_bigfile_filename_map(filelist_path: str | Path | None) -> dict[int, str
 
 
 def load_bigfile_filename_map_for_hashes(filelist_path: str | Path | None, hash_values: Iterable[int]) -> dict[int, str]:
-    """Resolve only the hashes present in an opened Bigfile.
-
-    Building the full filename map is intentionally broad: it indexes many path
-    spellings, CRC variants, byte-swapped variants, and inverted variants for
-    every line in the file list.  That is useful for tools, but the browser only
-    needs names for hashes that are actually in the archive header.  This targeted
-    resolver avoids allocating a huge all-variants dictionary during Bigfile open
-    while keeping the same matching behavior.
-    """
     if filelist_path is None or not str(filelist_path):
         return {}
     wanted = {int(value) & 0xFFFFFFFF for value in hash_values}
@@ -597,7 +582,6 @@ def _read_from_parts(base_path: Path, absolute_offset: int, size: int, alignment
 
 
 def _record_data_available(base_path: Path, absolute_offset: int, size: int, alignment: int = LEGEND_ALIGNMENT) -> bool:
-    """Return True when the record's stored bytes can be read from available archive parts."""
     base_path = Path(base_path)
     size = int(size)
     absolute_offset = int(absolute_offset)

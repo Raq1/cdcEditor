@@ -368,9 +368,6 @@ class TRNextGenModelParser:
         if header.num_materials <= 0 or not self._valid_abs(material_base, 1):
             return result
 
-        # The documented PCMaterialData record is fixed-size: 0x1C8 / 456 bytes.
-        # Some files have padding between the material table and the next block, so
-        # deriving stride from the table span can misalign later materials.
         material_stride = 456
 
         special_set = {int(value) for value in special_material_flags}
@@ -668,13 +665,6 @@ class TRNextGenModelParser:
 
     @staticmethod
     def _triangle_winding_parity(triangle: list[int] | tuple[int, int, int]) -> int:
-        """Return a stable parity bit for a triangle's vertex order.
-
-        For a fixed set of three distinct vertex indices, opposite winding has
-        the opposite permutation parity. This lets the importer detect PC
-        next-gen double-wound face pairs without relying on geometry normals or
-        adjacency.
-        """
         tri = [int(value) for value in triangle[:3]]
         if len(set(tri)) != 3:
             return 0
@@ -689,13 +679,6 @@ class TRNextGenModelParser:
 
     @classmethod
     def _count_double_wound_triangle_pairs(cls, triangles: list[list[int] | tuple[int, int, int]]) -> int:
-        """Count paired faces with identical vertices and opposite winding.
-
-        A material marked this way should be exported with both windings for
-        every affected face. Import collapses those explicit face-data pairs to
-        one editable Blender polygon and stores the material-level flag so the
-        exporter can regenerate the second winding when Double Sided is enabled.
-        """
         buckets: dict[tuple[int, int, int], list[int]] = {}
         for tri in triangles:
             if len(tri) != 3 or len(set(int(v) for v in tri)) != 3:
@@ -709,18 +692,6 @@ class TRNextGenModelParser:
 
     @classmethod
     def _collapse_double_wound_triangle_pairs(cls, triangles: list[list[int] | tuple[int, int, int]]) -> list[list[int]]:
-        """Collapse explicit PC next-gen front/back face pairs for Blender import.
-
-        TR7 PC next-gen stores double-sided geometry as two triangle records
-        with the same three vertices and opposite winding.  Blender only needs
-        one editable polygon; the imported material's Double Sided flag records
-        the intent, and export expands it back to the paired index data.
-
-        When a key has extra unpaired duplicates, only the matched opposite-
-        winding pairs are collapsed.  The kept representative uses the first
-        observed winding for that vertex set, preserving the source orientation
-        as much as possible.
-        """
         if not triangles:
             return []
 
@@ -823,10 +794,6 @@ class TRNextGenModelParser:
             score = self._score_index_data_start(header, batches, prim_groups, candidate)
             if score[0] < 0:
                 continue
-            # Prefer streams with all triangles valid; use the documented direct
-            # offset as the tie-breaker unless +0x10 gives a strictly better
-            # score.  This supports Underworld-style prefixed face data without
-            # shifting clean PCD9 index buffers.
             tie_break = 1 if int(extra) == 0 else 0
             ranked = (score[0], score[1], score[2], score[3], score[4], tie_break)
             if ranked > best_score:
@@ -926,11 +893,6 @@ class TRNextGenModelParser:
                 normal_id = int(material.normal_id)
                 specular_id = int(material.specular_id)
                 material_id = int(material.material_id)
-                # PC next-gen does not have the old texture-strip draw_group
-                # field.  In observed TR7 next-gen render data, PCMaterialData.id
-                # stores drawgroup + 1 (id 1 = drawgroup 0, id 6 = drawgroup 5).
-                # Falling back to the source model only when the id is absent keeps
-                # drawgroup separation and visibility consistent with old-gen.
                 draw_group = material_id - 1 if material_id > 0 else 0
                 if material_id <= 0 and self.source_model is not None:
                     try:
@@ -960,9 +922,6 @@ class TRNextGenModelParser:
                 )
                 self._copy_material_to_strip(strip, material)
                 strip.pc_nextgen_shader_table_ids = [int(value) for value in (shader_table_ids or [])]
-                # Keep these legacy fields populated as a broad compatibility fallback
-                # for tools that inspect TextureStrip directly, but Blender material
-                # creation now uses the pc_nextgen_* material state above.
                 strip.tr8_diffuse_texture_id = diffuse_id
                 strip.tr8_normal_texture_id = normal_id
                 strip.tr8_mask_texture_id = specular_id

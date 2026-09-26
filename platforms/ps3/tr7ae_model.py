@@ -22,24 +22,6 @@ from ..pc.tr7ae_model import TRModelParser
 
 
 class TRPS3ModelParser(TRModelParser):
-    """Importer for PS3 TRLAU model sections.
-
-    PS3 DRM containers and section headers are big-endian. The model skeleton
-    records use the normal 64-byte TRLAU segment layout, but most rendered
-    geometry is stored in a PS3 render stream referenced from the model header:
-
-    - header field 0x58 -> big-endian u16 triangle-strip index stream
-    - header field 0x5C -> stream vertex-buffer header
-    - vertex-buffer header +0x00: vertex count
-    - vertex-buffer header +0x04: pointer to 16-byte vertex records
-
-    The first six bytes of each PS3 stream vertex are signed big-endian XYZ
-    coordinates.  Bytes 8 and 9 hold the two compact skin slots observed in
-    character streams, while bytes 12 and 13 hold the corresponding 8-bit
-    blend weights.  The stream appears to be limited to two weights per
-    vertex.  The remaining payload bytes are still treated conservatively
-    until normals/UVs are fully mapped.
-    """
 
     PS3_STREAM_VERTEX_SIZE = 16
     PS3_STREAM_EXTRA_VERTEX_SIZE = 20
@@ -146,7 +128,6 @@ class TRPS3ModelParser(TRModelParser):
 
     @staticmethod
     def _decode_ps3_texture_id(tpage_value: int) -> int:
-        """Return the texture-resource id packed into an observed PS3 tpage word."""
         texture_id = int(tpage_value) & 0x1FFF
         if texture_id <= 0 or texture_id == 0x1FFF:
             return -1
@@ -154,23 +135,6 @@ class TRPS3ModelParser(TRModelParser):
 
     @classmethod
     def _read_ps3_material_texture_bindings(cls, material_context: SectionContext, record_abs: int) -> Dict[str, object]:
-        """Extract observed PS3 material texture stages.
-
-        Character PS3 material records use stable texture slots rather than the
-        generic PC tpage-only material.  The supplied samples show that the
-        slot previously guessed as the normal/bump map is actually the
-        specular/gloss stage:
-
-        - +0x10: primary diffuse/base-color texture
-        - +0x18: specular/gloss texture stage
-
-        Other stage words are still preserved as raw metadata.  We do not bind
-        any of them as a normal map automatically because the exact PS3 normal
-        map slot/encoding is not confirmed yet, and wiring the specular stage
-        into Blender's Normal input produces visibly incorrect shading.  The
-        PS3 Material panel exposes the editable Normal Texture ID field for
-        manual assignment once a specific model's normal stage is identified.
-        """
         stage_offsets = (0x14, 0x18, 0x20, 0x24, 0x28)
         diffuse_raw = cls._ps3_read_u32_from_context(material_context, record_abs + 0x10)
         diffuse_texture_id = cls._decode_ps3_texture_id(diffuse_raw)
@@ -193,10 +157,6 @@ class TRPS3ModelParser(TRModelParser):
 
         used: set[int] = {diffuse_texture_id} if diffuse_texture_id >= 0 else set()
 
-        # The observed +0x18 stage is spec/gloss, not a tangent normal map.
-        # Newer PS3 material records also have a valid +0x14 auxiliary stage;
-        # keep it available as a candidate, but do not treat it as specular
-        # before +0x18 unless +0x18 is absent.
         specular_raw, specular_texture_id = _valid_stage(0x18, used)
         if specular_texture_id >= 0:
             used.add(int(specular_texture_id))
@@ -207,9 +167,6 @@ class TRPS3ModelParser(TRModelParser):
                     used.add(int(specular_texture_id))
                     break
 
-        # Treat the first remaining auxiliary stage as the normal-map
-        # candidate and bind it as the imported PS3 normal texture.  The raw
-        # candidate fields are preserved so the mapping can still be audited.
         normal_candidate_raw, normal_candidate_texture_id = -1, -1
         for offset in (0x14, 0x20, 0x28, 0x24):
             candidate_raw, candidate_texture_id = _valid_stage(offset, used)
@@ -241,26 +198,6 @@ class TRPS3ModelParser(TRModelParser):
         num_segments: int,
         total_index_values: int,
     ) -> List[Dict[str, object]]:
-        """Parse PS3 material draw packets and their compact-bone palettes.
-
-        The PS3 render path does not store global segment ids in the 16-byte
-        vertex records.  It stores compact matrix slots.  The material/draw
-        records referenced by model header field 0x4C carry the actual palette
-        for each index-stream range:
-
-            u32 index_start
-            u32 index_count
-            u16 palette_count
-            u16 palette[palette_count]
-
-        Multiple packets can be embedded between one material record and the
-        next material-record pointer.  Parsing these packets is more reliable
-        than assigning one guessed palette to an entire mesh or strip.
-
-        Material record +0x0C is the observed PS3 drawgroup value.  It is not
-        generated from packet/material order; game scripting uses this value to
-        hide/show material groups.
-        """
         if material_abs <= 0 or material_abs + 0x94 > material_context.file_size:
             return []
 
@@ -437,20 +374,6 @@ class TRPS3ModelParser(TRModelParser):
 
     @classmethod
     def _decode_ps3_extra_normal(cls, record: bytes) -> Tuple[int, int, int]:
-        """Decode the best observed PS3 vector candidate from the secondary stream.
-
-        The PS3 render payload for the supplied TRLAU character samples stores
-        the primary 16-byte stream first, followed by a 20-byte-per-vertex
-        attribute stream aligned to 0x20.  In that attribute stream bytes 4..7
-        are UVs and bytes 8..11 are the first signed 8-bit vector candidate.
-
-        Earlier builds used X/Y/Z = byte10/byte9/byte8.  Cross-checking the
-        same stream against generated geometric normals across the Lara, Natla,
-        Demon Natla, Kid, and Kold samples shows that the least-bad ordering is
-        X/Y/Z = -byte11/-byte10/+byte8.  This is still treated as provisional
-        by the mesh builder; if the vector set fails a face-normal sanity check,
-        Blender-generated smooth normals are used instead.
-        """
         if len(record) < 12:
             return (0, 0, 127)
         nx = -cls._i8_from_byte(record[11])
@@ -462,14 +385,6 @@ class TRPS3ModelParser(TRModelParser):
 
     @staticmethod
     def _decode_ps3_extra_color(record: bytes) -> Tuple[int, int, int, int] | None:
-        """Decode the observed PS3 secondary-stream vertex color.
-
-        The first four bytes of the 20-byte PS3 secondary vertex record behave
-        like ARGB color/modulation data in the supplied character and prop
-        samples.  Import RGB as Blender color data and keep the first byte as
-        alpha metadata, but the PS3 shader does not use this alpha for
-        transparency automatically.
-        """
         if len(record) < 4:
             return None
         a = int(record[0]) & 0xFF
@@ -484,17 +399,6 @@ class TRPS3ModelParser(TRModelParser):
         primary_vertex_data_abs: int,
         vertex_count: int,
     ) -> Tuple[List[bytes], int]:
-        """Read the PS3 secondary attribute stream when present.
-
-        The model header only points at the first 16-byte stream.  The observed
-        PS3 character files place an aligned 20-byte stream immediately after it:
-
-            bytes 0..3   vertex color / render attribute
-            bytes 4..7   UV, big-endian u16 S/T
-            bytes 8..11  normal vector, signed byte Z/Y/X/W
-            bytes 12..15 tangent-like vector
-            bytes 16..19 bitangent-like vector
-        """
         count = int(vertex_count)
         if count <= 0:
             return [], 0
@@ -527,15 +431,6 @@ class TRPS3ModelParser(TRModelParser):
         vertex_count: int,
         segments: List[Segment],
     ) -> Tuple[List[MVertex], int, int]:
-        """Read the PS3 external render-stream variant.
-
-        Some PS3 models store indices and vertices in a separate type-3 render
-        section.  Model header field +0x64 points at the u16 index stream and
-        +0x68 points at a small vertex-stream header inside that same section.
-        The first word of that header is a relocated/local pointer to the
-        16-byte vertex records; the vertex count still comes from the model
-        header at +0x20.
-        """
         count = int(vertex_count)
         if count <= 0 or count > 10000000:
             return [], int(count), 0
@@ -707,10 +602,6 @@ class TRPS3ModelParser(TRModelParser):
                         uv_raw = (uvx, uvy)
                         uv_decoded = (float(uvx) / 4096.0, 1.0 - (float(uvy) / 4096.0))
 
-                    # PS3 stream vertices store compact skin slots.  The real
-                    # segment ids are supplied by the draw packet's bone
-                    # palette, so keep the compact slots on the intermediate
-                    # vertex and resolve them during packet materialization.
                     primary_slot = int(record[8])
                     secondary_slot = int(record[9])
                     primary_weight_u8 = int(record[12])
@@ -1059,12 +950,6 @@ class TRPS3ModelParser(TRModelParser):
                 (int(value) for value in external_index_values if int(value) not in self.PS3_RESTART_INDICES),
                 default=-1,
             )
-            # In the external PS3 render-stream variant, the model-header
-            # vertex count is sometimes the logical/CPU count, not the GPU
-            # stream count.  The u16 index stream and the packed vertex/extra
-            # streams line up exactly when the GPU count is max(index)+1.
-            # Using the smaller header count drops valid indexed vertices and
-            # makes these models import with zero geometry.
             external_stream_vertex_count = max(int(num_vertices), int(external_max_index) + 1)
             external_vertices, external_vertex_count, external_vertex_data_raw = self._read_ps3_external_stream_vertices(
                 cache,
@@ -1110,10 +995,6 @@ class TRPS3ModelParser(TRModelParser):
             len(index_values),
         )
         if not draw_packets and index_stream_abs:
-            # Some PS3 DRMs point materialInfo at a tiny render-data stub while
-            # the actual material records live at the model header's indexStream
-            # pointer.  The index buffer itself can still be external; the
-            # packet offsets/counts are relative to the active index stream.
             draw_packets = self._read_ps3_material_draw_packets(
                 index_stream_ctx,
                 index_stream_abs,

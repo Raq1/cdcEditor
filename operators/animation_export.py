@@ -305,12 +305,14 @@ class TRLAUAnimationExporter:
 
     @classmethod
     def _resolve_anim_id(cls, action: bpy.types.Action, path: Path, existing: _ExistingAnimationHeader | None) -> int:
+        if existing is not None and int(existing.section_id) > 0:
+            return int(existing.section_id)
+        if existing is not None and int(existing.anim_id) > 0:
+            return int(existing.anim_id)
         filename_id = cls._anim_id_from_filename(path)
         if filename_id is not None:
             return int(filename_id)
-        if existing is not None and int(existing.anim_id) > 0:
-            return int(existing.anim_id)
-        raise ValueError('Could not determine animation ID. Use a .ani filename containing the animation ID.')
+        raise ValueError('Could not determine animation ID. Use a filename containing the animation ID.')
 
     @staticmethod
     def _bone_index_range_from_armature(armature: bpy.types.Object) -> int:
@@ -447,17 +449,6 @@ class TRLAUAnimationExporter:
         start: int,
         end: int,
     ) -> tuple[list[list[float]], list[list[tuple[int, float]]]] | None:
-        """Recover game-space rotation-vector tracks from sparse linear keys.
-
-        Imported rotations are stored as three independent game-space
-        rotation-vector axis tracks, but Blender displays them as quaternion
-        curves. If we compress dense quaternion evaluation directly, tiny
-        quaternion/log-map roundoff can create many fake breakpoints on axes
-        that were originally simple Linear tracks. For linear integer-frame
-        rotation curves, convert only the real keyed frames back to game-space,
-        simplify each axis independently, then expand those simplified axis keys
-        back to per-frame values for Constant/Linear/Raw selection.
-        """
         if not cls._all_rotation_keyframes_are_linear(curves):
             return None
         frames = cls._integer_rotation_keyframe_frames(curves, start, end)
@@ -623,7 +614,6 @@ class TRLAUAnimationExporter:
 
     @classmethod
     def _linear_keyframes_from_values(cls, values: list[float], tolerance: float = 1.0e-5) -> list[tuple[int, float]]:
-        """Build exact-enough piecewise-linear keys using TRLAU's byte-delta frame indices."""
         if not values:
             return [(0, 0.0)]
         if len(values) == 1:
@@ -739,17 +729,6 @@ class TRLAUAnimationExporter:
 
     @classmethod
     def _choose_track_mode(cls, values: list[float], keyframes: list[tuple[int, float]] | None = None) -> int:
-        """Choose Constant(1), Linear(2), or Raw(0) from the exported values.
-
-        Constant is used for unchanged tracks. Linear is used when the data has
-        sparse integer-frame linear keys that pack smaller than raw per-frame
-        storage. Raw is used when dense storage is smaller or more accurate.
-        
-        When a track came from actual integer-frame linear keys, use a tighter
-        constant tolerance. Original .ani files sometimes store tiny but real
-        two-key linear spans, and collapsing those to Constant changes the
-        packed structure and size.
-        """
         keyed_frames = {int(frame) for frame, _value in (keyframes or [])}
         constant_tolerance = _KEYED_CONSTANT_TOLERANCE if len(keyed_frames) >= 2 else _EPSILON
         if cls._values_are_constant(values, tolerance=constant_tolerance):

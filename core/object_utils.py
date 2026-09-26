@@ -31,7 +31,6 @@ _HMARKER_INDEX_RE = re.compile(r'(?:^|_)HMarker_(?:Missing_)?(\d+)(?:\D|$)')
 
 
 def hmarker_index_from_name(obj_or_name, default: int = 0) -> int:
-    """Return the authored HMarker index encoded in the object name."""
     try:
         name = str(getattr(obj_or_name, 'name', obj_or_name) or '')
         match = _HMARKER_INDEX_RE.search(_strip_blender_numeric_suffix(name))

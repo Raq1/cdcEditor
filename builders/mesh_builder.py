@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -408,7 +409,13 @@ class MeshBuilder(PspModelBuilderMixin, PlatformTextureLoaderMixin, MaterialNode
                 attributes.remove(attr)
         except Exception:
             pass
-        for key in ('trlau_mface_sort_top_to_bottom',):
+        for key in (
+            'trlau_mface_sort_top_to_bottom',
+            'trlau_mface_source_face_points_v2',
+            'trlau_mface_source_vertex_count_v2',
+            'trlau_mface_source_polygon_count_v2',
+            'trlau_mface_source_point_count_v2',
+        ):
             try:
                 if key in mesh:
                     del mesh[key]
@@ -416,7 +423,6 @@ class MeshBuilder(PspModelBuilderMixin, PlatformTextureLoaderMixin, MaterialNode
                 pass
 
     def _cleanup_import_debug_metadata(self, obj) -> None:
-        """Remove importer/debug ID properties from newly built data blocks."""
         stale_object_keys = (
             'trlau_model_scale',
         )
@@ -489,20 +495,50 @@ class MeshBuilder(PspModelBuilderMixin, PlatformTextureLoaderMixin, MaterialNode
 
     def _apply_mface_metadata(self, mesh, model: ModelData) -> None:
         self._clear_render_mface_metadata(mesh)
-        vertex_count = len(model.vertices or [])
+        vertex_count = len(getattr(mesh, 'vertices', []) or [])
         source_faces = list(model.faces or [])
         if vertex_count <= 0 or not source_faces:
             return
         if not any(int(getattr(face, 'same_vert_bits', 0) or 0) != 0 for face in source_faces):
             return
 
-        _ranges, source_by_game_vertex = self._collect_mface_source_ranges(model)
+        tolerance = 0.00001
+        grouped: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+        for vertex in getattr(mesh, 'vertices', []) or []:
+            co = vertex.co
+            key = (
+                int(round(float(co.x) / tolerance)),
+                int(round(float(co.y) / tolerance)),
+                int(round(float(co.z) / tolerance)),
+            )
+            grouped[key].append(int(vertex.index))
+
+        ordered_groups = [
+            indices
+            for _key, indices in sorted(
+                grouped.items(),
+                key=lambda item: (min(item[1]) if item[1] else 0, item[0]),
+            )
+        ]
+        values = [-1] * vertex_count
+        next_point = 0
+        for indices in ordered_groups:
+            ordered = sorted({int(index) for index in indices if 0 <= int(index) < vertex_count})
+            for chunk_start in range(0, len(ordered), 31):
+                chunk = ordered[chunk_start:chunk_start + 31]
+                for vertex_index in chunk:
+                    values[vertex_index] = int(next_point)
+                next_point += 1
+        for vertex_index in range(vertex_count):
+            if values[vertex_index] < 0:
+                values[vertex_index] = int(next_point)
+                next_point += 1
+
         try:
             attributes = getattr(mesh, 'attributes', None)
             if attributes is None:
                 return
             attr = attributes.new(name='MFacePoint', type='INT', domain='POINT')
-            values = [int(source_by_game_vertex.get(index, index)) for index in range(len(mesh.vertices))]
             try:
                 attr.data.foreach_set('value', values)
             except Exception:
@@ -510,7 +546,7 @@ class MeshBuilder(PspModelBuilderMixin, PlatformTextureLoaderMixin, MaterialNode
                     item.value = int(value)
             mesh['trlau_mface_sort_top_to_bottom'] = False
         except Exception as exc:
-            logger.warning('Failed storing MFacePoint attribute: %s', exc)
+            logger.warning('Failed storing regenerated MFacePoint attribute: %s', exc)
 
     def _build_texture_path_index(self, model_dir: Path) -> Dict[int, Path]:
         cache_key = Path(model_dir).resolve()

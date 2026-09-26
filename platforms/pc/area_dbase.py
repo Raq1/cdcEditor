@@ -573,10 +573,6 @@ class AreaDBaseParser:
                 start_x = _sign_extend(int(raw_x) & 0x1FFF, 13)
                 start_y = _sign_extend(int(raw_y) & 0x1FFF, 13)
                 edge_type = (int(raw_y) >> 13) & 0x7
-                # Area X/Y are coarse 128-unit cells. AEdge start X/Y are
-                # signed 13-bit offsets in 1/8 world-unit granularity. Scaling
-                # the edge offset by 8 makes connected edges land exactly on
-                # their neighbouring area's reverse edge.
                 game_pos = (
                     float((int(pos_x) * self.AREA_XY_WORLD_SCALE) + (int(start_x) * self.EDGE_START_WORLD_SCALE)),
                     float((int(pos_y) * self.AREA_XY_WORLD_SCALE) + (int(start_y) * self.EDGE_START_WORLD_SCALE)),

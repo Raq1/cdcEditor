@@ -173,10 +173,6 @@ class PlatformTextureLoaderMixin:
                 except Exception:
                     existing_platform = ''
 
-                # Bigfile/direct-DRM imports may pre-load every extracted PCD
-                # before the model importer assigns material images.  Reuse the
-                # already decoded image when it came from this exact PCD instead
-                # of creating Blender's automatic ``.001`` copy.
                 if (
                     existing_source == str(texture_path)
                     and (not decoded_platform or not existing_platform or existing_platform == decoded_platform)
@@ -184,10 +180,6 @@ class PlatformTextureLoaderMixin:
                     self._loaded_texture_cache[cache_key] = existing
                     return existing
 
-                # Older PS2 Bigfile imports could mis-detect PS2 PCDs as PSP
-                # during the eager "Import All Textures" pass.  If that stale
-                # placeholder is unused, remove it so the correct PS2 decode can
-                # keep the expected texture name.
                 if (
                     decoded_platform == 'ps2'
                     and existing_source == str(texture_path)
@@ -247,12 +239,6 @@ class PlatformTextureLoaderMixin:
                     temp_dds_path.unlink(missing_ok=True)
                 except Exception:
                     pass
-            # For PS3 DDS textures we intentionally keep the temporary DDS on
-            # disk and do not pack during import.  Packing several large DDS
-            # images while Blender is also building mesh/material data can make
-            # the UI appear hung.  The image remains linked to this cached DDS
-            # for the current Blender session and can still be packed manually
-            # later if the user wants a self-contained .blend.
 
             self._loaded_texture_cache[cache_key] = image
             return image
@@ -335,9 +321,6 @@ class PlatformTextureLoaderMixin:
                 },
             )
 
-        # PSP and PS2 PCD headers share several marker values. Use the model
-        # parser's platform/UV format to avoid routing PS2 textures through the
-        # PSP decoder or vice versa. PS3 uses a PS3T marker and is safe to probe.
         if platform_hint == 'ps3':
             return _try_load_ps3_texture()
         if platform_hint == 'xbox360':

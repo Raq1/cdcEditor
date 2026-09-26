@@ -585,10 +585,6 @@ class TR8ModelParser:
             data = Path(shader_path).read_bytes()
         except Exception:
             return []
-        # The TR8 shader sections contain compiled D3D9 bytecode with CTAB
-        # comment chunks.  Full bytecode decompilation is unnecessary for material
-        # binding: extracting the CTAB/ASCII names gives shader and sampler context
-        # for diagnostics while the .matd texture table supplies the actual refs.
         strings = self._printable_strings(data, min_length=4, limit=64)
         return [text for text in strings if text not in {'SECT', 'CTAB'}]
 
@@ -725,10 +721,6 @@ class TR8ModelParser:
             strip.tr8_texture_stage_slots = [int(texture.slot) for texture in material.textures]
 
             diffuse_id = self._first_texture_id_by_type(material, 1)
-            # Some simple TR8 materials in the current samples have no explicit
-            # type-1 Diffuse entry; their color map is the first type-0 entry.
-            # Preserve type-0 as Mask metadata too, but use it as a diffuse
-            # fallback so the material is not left untextured.
             mask_id = self._first_texture_id_by_type(material, 0)
             if diffuse_id < 0:
                 diffuse_id = mask_id
@@ -1183,10 +1175,6 @@ class TR8ModelParser:
                     unreadable += int(group.num_faces)
                     continue
 
-                # Sampling every face is still cheap for the current samples, but
-                # cap nothing here: this scoring is run only a few times and it
-                # prevents selecting a shifted stream that merely looks plausible
-                # at the beginning of a large model.
                 br.seek(context.data_start + int(index_data_local) + start)
                 for _ in range(int(group.num_faces)):
                     i0 = int(br.u16())
@@ -1215,11 +1203,6 @@ class TR8ModelParser:
         if num_indices <= 0:
             return -1
 
-        # TR8 PC face data can start directly at offsetFaceData, or it can be
-        # preceded by a small normal/winding-order blob.  Most currently tested
-        # character meshes have a 16-byte prefix; some resources do not.  The
-        # mesh groups still index the triangle index buffer from zero, so choose
-        # the stream start that produces valid local indices for every group.
         candidate_offsets = (0x10, 0x00, 0x08, 0x04, 0x0C, 0x14, 0x20)
         best_local = -1
         best_score: tuple[int, int, int, int, int, int] = (-1, -999999, -999999, -999999, -1, -999999)
@@ -1228,9 +1211,6 @@ class TR8ModelParser:
             score = self._score_face_index_data_start(context, meshes, groups, candidate_local, int(num_indices))
             if score[0] < 0:
                 continue
-            # Prefer streams with no out-of-bounds/degenerate triangles, then
-            # use +0x10 only as a weak tie-breaker because that is the common
-            # normal/winding-prefix layout in the verified TRU samples.
             tie_break = 1 if int(extra) == 0x10 else 0
             ranked_score = (score[0], score[1], score[2], score[3], score[4], tie_break)
             if ranked_score > best_score:
@@ -1426,9 +1406,6 @@ class TR8ModelParser:
         br = context.reader
         previous = br.tell()
         try:
-            # The last self-relocation in the observed TR8 mesh files points to
-            # a skeleton-array ref.  The array header sits 16 bytes before that
-            # ref target: uint count; uint bonesOffset; uint[2] reserved.
             candidates: List[int] = []
             for relocation in reversed(context.section_info.relocations):
                 if int(relocation.section_index_or_type) not in {0, int(context.section_info.section_id), int(context.filepath.stem.split('_', 1)[0]) if '_' in context.filepath.stem else -1}:
@@ -1437,16 +1414,6 @@ class TR8ModelParser:
                 if not self._valid_local(context, field_local, 4):
                     continue
                 value = self._read_u32_at(context, field_local)
-                # Observed TR8 PC meshes use two closely related skeleton
-                # reference layouts.  Most samples have a 16-byte array header
-                # immediately before the relocated pointer target:
-                #   uint count; uint bonesOffset; uint[2] reserved
-                # The zipped-Lara style DRM instead stores only:
-                #   uint count; uint bonesOffset
-                # immediately before the bone records.  The relocation field
-                # itself points at bonesOffset, so value - 8 / field - 4 is the
-                # actual header.  Try both layouts; validation below rejects
-                # non-skeleton candidates.
                 for header_local in (int(value) - 16, int(value) - 8):
                     if self._valid_local(context, header_local, 8):
                         candidates.append(header_local)
@@ -1589,9 +1556,6 @@ class TR8ModelParser:
         if stride <= 0:
             return None
 
-        # The final vertex stream can run right up to the actual index buffer.
-        # offsetFaceData may point at a 16-byte winding/normal prefix before the
-        # indices, so allow that prefix-sized slack when estimating the count.
         available_bytes = max(0, (int(offset_face_data) + 0x10) - int(stream_start))
         inferred_vertices = available_bytes // int(stride)
         group_vertex_sum = sum(int(group.num_vertices) for group in batch_groups)
@@ -1711,10 +1675,6 @@ class TR8ModelParser:
 
     @staticmethod
     def _find_ps2_mesh_header_local(context: SectionContext) -> int:
-        # Underworld PS2 cdcModelData sections use a compact binary header with
-        # the marker 0xFFEEDDCC at local offset 0x10 in all samples observed so
-        # far.  Keep a small scan fallback so extracted/repacked sections with
-        # a different pointer prefix still parse.
         if context.data_size >= 0x70 and TR8ModelParser._read_u32_at(context, 0x10) == 0xFFEEDDCC:
             return 0x10
         limit = min(int(context.data_size) - 0x10, 0x200)
@@ -1886,9 +1846,6 @@ class TR8ModelParser:
                 valid_parent_count += 1
             elif 0 <= parent < int(segment.index):
                 valid_parent_count += 1
-        # Prefer real record tables over pointer/metadata blocks that happen to
-        # satisfy the broad parent checks.  A useful skeleton generally has a
-        # single root and non-zero pivots for most child bones.
         score = float(valid_parent_count)
         score += float(nonzero_pivots) * 4.0
         if root_count == 1:
@@ -1927,12 +1884,6 @@ class TR8ModelParser:
             for count in (header_bone_count, meta_count, header_count_2):
                 add_candidate(meta_records, count, 0)
 
-        # In PS2 Underworld samples seen so far, the canonical skeleton table
-        # is often referenced by a compact {count, records_ptr} pair elsewhere
-        # in the mesh section.  The previous heuristic missed this in the Yeti
-        # Thrall sample and instead accepted the per-part helper table at root3,
-        # producing a scrambled armature.  Scan for an exact bone_count/pointer
-        # pair before falling back to broader pointer-region guesses.
         try:
             previous_pos = context.reader.tell()
             context.reader.seek(context.data_start)
@@ -1995,10 +1946,6 @@ class TR8ModelParser:
         return best_segments
 
     def _parse_tr8ps2_blend_records(self, context: SectionContext, header_local: int) -> list[list[tuple[int, float]]]:
-        # The first table after the compact PS2 mesh header is a skin-blend
-        # table.  Each 8-byte record is four u8 bone ids followed by four u8
-        # weights.  The active VIF packets reference these records through their
-        # chunk-local matrix/blend palette.
         packed_count = self._read_u32_at(context, int(header_local) + 0x48, 0)
         blend_count = (int(packed_count) >> 16) & 0xFFFF
         bone_count = self._read_u32_at(context, int(header_local) + 0x4C, 0)
@@ -2036,12 +1983,6 @@ class TR8ModelParser:
 
     @staticmethod
     def _tr8ps2_find_vif_preamble(data: bytes, start_local: int, vertex_count: int) -> tuple[list[int], list[int]]:
-        # A render chunk has a small CPU/VU preamble immediately before the VIF
-        # attribute unpacks.  The preamble repeats the first sort-key float, then at
-        # +0x14 stores: u8 vertexCount, u8 unknown/destination, u8 paletteCount,
-        # followed by paletteCount u8 blend-record references.  At +0x20 it also
-        # stores the VU destination/source ids for the packet vertices.  These ids
-        # are useful for research but the skinning comes from the blend table.
         start_local = int(start_local)
         vertex_count = int(vertex_count)
         if start_local < 12 or start_local + 12 > len(data):
@@ -2103,11 +2044,6 @@ class TR8ModelParser:
             if len(accum) >= 7:
                 min_x = float(accum[5])
                 max_x = float(accum[6])
-                # Some PS2 blend nodes are shared across both sides of the body.
-                # Their weighted centroid can drift left or right depending on
-                # how much surface area was sampled.  If the node clearly spans
-                # both sides, score it as a centre-line node instead of letting it
-                # collapse onto a thigh/arm solely because the mesh is asymmetric.
                 if min_x < -25.0 and max_x > 25.0 and abs(cx) < 55.0:
                     cx = 0.0
 
@@ -2246,11 +2182,6 @@ class TR8ModelParser:
             next_area = int(nxt.get('area', 0) or 0)
             if area <= 0 or next_area <= 0:
                 continue
-            # Observed auxiliary slots in the supplied PS2 TR8 samples are
-            # tail entries: 64x64 or smaller lookup/reflection maps immediately
-            # before substantially larger 128/256px diffuse maps.  Restricting
-            # this to the tail avoids removing ordinary early small diffuse
-            # textures such as backpack, eye, hair, and accessory pieces.
             if area <= 0x1000 and next_area >= 0x4000 and next_area >= area * 8:
                 skip_slots.add(int(slot))
 
@@ -2294,21 +2225,6 @@ class TR8ModelParser:
                 chunk_starts.append(int(local))
         except Exception:
             chunk_starts = []
-        # Some PS2 TR8 material runs use a paired texture-page setup: the run
-        # carries a primary material value plus a secondary material value and a
-        # small stage/control word (observed 0x842).  The next material value in
-        # the run table can then alias back to that secondary texture instead of
-        # advancing to the next raw texture-list slot.  Lara eye materials are
-        # the clearest supplied case: the eyelash/eye-page run is value 5+6,
-        # while the following eye draw uses value 7 but still resolves to the
-        # texture referenced by secondary value 6.  Keep this as a value->slot
-        # remap while walking the already sorted run table.
-        # First collect enough context to choose the PS2 material-indexing mode.
-        # The early Lara PS2 tables use material value 0 as the first/root
-        # texture and then use several low positive values as absolute texture
-        # slots.  Tables that never reference 0 behave as the older one-based
-        # material list.  A paired 0x842 stage can also alias only the next draw
-        # run; it is not a global value remap.
         has_primary_zero = False
         for probe_run_index in range(int(run_count)):
             probe_base = table_local + (probe_run_index * 0x28)
@@ -2333,11 +2249,6 @@ class TR8ModelParser:
                 return True
             if value == 0:
                 return bool(texture_ids)
-            # Positive PS2 material values are interpreted against the compact
-            # diffuse-material list.  Some meshes store one trailing sentinel
-            # record after the real run list; its material fields are floats,
-            # pointers, or unrelated dwords.  Reject those here instead of
-            # allowing the fallback mapping to turn them into real materials.
             if 0 <= (value - 1) < len(diffuse_slots):
                 return True
             if 0 <= (value - 1) < len(texture_ids):
@@ -2369,12 +2280,6 @@ class TR8ModelParser:
                 )
                 continue
 
-            # The PS2 draw-run material fields are not zero-based texture-list
-            # indices.  In the observed Underworld PS2 meshes, material value 0
-            # is the default first texture, while positive values are one-based
-            # texture slots.  Treating value 1 as texture_ids[1] made the main
-            # tiger body use its tiny auxiliary map and made Lara's lower-body
-            # run use the metal/detail map.
             stage_indices: list[int] = []
 
             def _slot_looks_like_auxiliary_after_diffuse(raw_slot: int) -> bool:
@@ -2419,10 +2324,6 @@ class TR8ModelParser:
                     and int(value) == int(pending_stage_alias_value)
                     and pending_stage_alias_slot is not None
                     and 0 <= int(pending_stage_alias_slot) < len(texture_ids)
-                    # Runs with the high 0x00200000 state bit return to the
-                    # normal texture-slot namespace.  This is what separates
-                    # Lara's iris draw from the following hair/eyelid draw, even
-                    # though both use material value 7.
                     and not (int(run_flags) & 0x00200000)
                 ):
                     alias_slot = int(pending_stage_alias_slot)
@@ -2434,21 +2335,8 @@ class TR8ModelParser:
                     return _one_based_texture_slot_from_material_value(value)
 
                 if has_primary_zero:
-                    # Zero-inclusive TR8 PS2 material tables use ordinary
-                    # primary material values as zero-based entries in the
-                    # mesh-local texture list.  The earlier builds only applied
-                    # this to a few low values, which fixed some Lara head runs
-                    # but shifted later body/outfit materials back to the wrong
-                    # one-based slots.  Keep the special paired-stage path above
-                    # for 0x842 eye/lash records; ordinary records stay
-                    # zero-based here.
                     raw_slot = value
                     if 0 <= raw_slot < len(texture_ids):
-                        # Some two-texture meshes include a tiny lookup/detail
-                        # texture directly after a large diffuse map.  Those
-                        # are not intended as the visible base texture for a
-                        # primary material value, so retain the conservative
-                        # fallback used for tiger/merc-style cases.
                         if _slot_looks_like_auxiliary_after_diffuse(raw_slot):
                             return raw_slot - 1
                         return int(raw_slot)
@@ -2466,22 +2354,11 @@ class TR8ModelParser:
             diffuse_slot = int(stage_indices[0]) if stage_indices else -1
             stage_blend_mode = ''
 
-            # Paired material-stage runs should keep the primary texture as the
-            # visible diffuse stage.  The previous preview build promoted the
-            # secondary stage for Lara's eye pair (for example B1+B2 -> B2),
-            # which put the iris texture on the eyelash geometry.  The secondary
-            # is real data, but it is not the base diffuse texture for this run.
-            # Preserve it as metadata and use it to resolve the following alias
-            # material value where observed.
             if len(stage_indices) >= 2 and int(stage_control) == 0x842:
                 try:
                     secondary_slot_for_alias = int(stage_indices[1])
                     alias_value = int(secondary_index) + 1
                     if 0 <= secondary_slot_for_alias < len(texture_ids) and alias_value > 0:
-                        # This alias is consumed by the next matching run only.
-                        # Keeping it global made later material-7 runs inherit
-                        # the iris texture, which put eye texture data on Lara's
-                        # eyelid/hair geometry.
                         pending_stage_alias_value = int(alias_value)
                         pending_stage_alias_slot = int(secondary_slot_for_alias)
                         logger.info(
@@ -2500,20 +2377,7 @@ class TR8ModelParser:
 
             diffuse_texture_id = int(texture_ids[diffuse_slot]) if 0 <= diffuse_slot < len(texture_ids) else -1
             stage_ids = [int(texture_ids[index]) for index in stage_indices]
-            # Do not treat the low-byte 0x71 state as Blender alpha
-            # blending.  That bit pattern appears on ordinary PS2 character
-            # hair/skin/detail runs as well as candidate translucent draws, and
-            # forcing BLEND in Blender made opaque body materials render
-            # incorrectly.  Keep the raw run state as metadata; let texture
-            # alpha use the existing CLIP path until the real GS alpha state
-            # table is mapped.
             alpha_blend = False
-            # Build a material-binding key from the PS2 material state, not just
-            # from the resolved diffuse texture.  Multiple draw runs can share a
-            # true material and should merge, but runs with the same diffuse
-            # texture and different secondary stage / render-state words must
-            # stay separate.  Grouping only by texture made selected Blender
-            # materials contain unrelated UV islands from different PS2 states.
             material_binding_key = (
                 int(primary_index),
                 int(secondary_index),
@@ -2678,13 +2542,6 @@ class TR8ModelParser:
         tr8ps2_blend_count = len(blend_records)
         tr8ps2_bone_count = int(self._read_u32_at(context, int(header_local) + 0x4C, 0))
 
-        # First pass: decode packet streams and attach the chunk-local palette.
-        # The palette uses a compact split namespace:
-        #   0 .. bone_count - 1                 => direct rigid skeleton bone id
-        #   bone_count .. bone_count+blend_count => index into the 8-byte blend table
-        # Previous preview builds treated low values as blend-record ids and high
-        # values as bone_count/blend_count aliases; that produced the random
-        # weighted islands seen in Blender.
         for start_local in starts:
             streams = self._parse_tr8ps2_vif_chunk(context, start_local)
             if streams is None:
@@ -2713,11 +2570,6 @@ class TR8ModelParser:
                 if 0 <= palette_ref < tr8ps2_bone_count:
                     return [(int(palette_ref), 1.0)]
 
-                # Blended reference.  The blend-table namespace starts exactly
-                # after the direct bone namespace, not at zero and not after the
-                # blend table itself.  Example from Lara main: bone_count=121,
-                # palette value 121 => blend record 0, 122 => blend record 1,
-                # etc.
                 blend_index = int(palette_ref) - int(tr8ps2_bone_count)
                 if 0 <= blend_index < tr8ps2_blend_count:
                     normalized = self._tr8ps2_normalize_weights(blend_records[blend_index])

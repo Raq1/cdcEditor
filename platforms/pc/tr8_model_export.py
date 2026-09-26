@@ -798,14 +798,6 @@ def _source_vertex_format_template_at(data: bytes | bytearray, vertex_components
 
 
 def _choose_source_vertex_format_template(data: bytes | bytearray, header_offset: int, warning_cb=None) -> _TR8VertexFormatTemplate:
-    """Choose a PC TR8 vertex declaration from the source mesh.
-
-    Earlier experimental exporters wrote a generic 40-byte declaration.  That is
-    too optimistic for Underworld PC: Lara's main mesh mixes declarations, and
-    some material/shader paths expect the second UV element that exists in the
-    44-byte source declaration.  For a scratch rebuild, copy the most complete
-    source declaration and pack every rebuilt batch with that declaration.
-    """
     candidates: list[_TR8VertexFormatTemplate] = []
     mesh_info_offset = _u32_at(data, int(header_offset) + 0x70)
     mesh_record_count = 0
@@ -1527,13 +1519,6 @@ def _pack_skeleton_records(arm_obj, batches: Sequence[_TR8Batch], warning_cb=Non
 
 
 def _pack_tr8_mesh_data(mesh_obj, arm_obj, model_root, render_id: int, warning_cb=None, source_template: Path | None = None) -> tuple[bytes, list[_Relocation], int, int, int, int, int]:
-    """Write an Underworld cdcModelData/tr8mesh payload fully from scratch.
-
-    The source_template argument is accepted so the replacement section keeps the
-    same DRM resource identity and can reuse model-family header compatibility
-    masks.  Geometry buffers, mesh records, runtime hierarchy, material table,
-    vertex declarations, skeleton records, and relocations are generated here.
-    """
     del render_id
     source_template_path = Path(source_template) if source_template is not None else None
     header_opaque_block = _source_mesh_header_opaque_block(source_template_path)

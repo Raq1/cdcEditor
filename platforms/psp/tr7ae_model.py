@@ -24,14 +24,8 @@ class PSPPrimitiveInfo:
     data_offset: int
     first_vertex_hint: int
     bone_palette: List[int]
-    # Primitive-local UV rectangle/affine range.  Older PSP model records
-    # use this as a normalized UV remap; newer records reuse the same bytes
-    # for different primitive data, so it must be validated before use.
     uv_rect: Tuple[float, float, float, float]
     raw: bytes
-    # Resolved relocation target for PrimitiveInfo::data_offset.  Some PSP
-    # models store a raw zero here and rely entirely on the relocation entry to
-    # select the geometry/index-stream section.
     data_context: SectionContext | None = None
     data_local_offset: int = 0
 
@@ -41,10 +35,6 @@ class PSPPrimitiveInfo:
 
     @property
     def render_flags(self) -> int:
-        # PSP PrimitiveInfo +0x02 stores the native vertex mode in the low byte.
-        # The high byte is also the drawgroup value observed in TRA PSP model
-        # sections.  Keep exposing it through the existing render-flags metadata
-        # path for compatibility with older imported materials.
         return (int(self.mode_word) >> 8) & 0xFF
 
     @property
@@ -64,14 +54,6 @@ class PSPPrimitiveInfo:
 
 
 class TRPSPModelParser(TRModelParser):
-    """Experimental PSP model parser.
-
-    PSP object sections use the PC object layout, but model geometry differs:
-    segments are the compact 32-byte layout, and Model::primitiveInfo contains
-    either 0x9C-byte or 0xA0-byte primitive records depending on the PSP asset
-    revision.  The parser scores both layouts per model instead of assuming one
-    global stride.
-    """
 
     PSP_MODEL_VERSION = 0x04C20453
     PRIMITIVE_STRIDES = (0xA0, 0x9C)
@@ -94,21 +76,10 @@ class TRPSPModelParser(TRModelParser):
 
     @staticmethod
     def _canonicalize_psp_tpageid(texture_id: int, blend: int = 0) -> int:
-        # Keep the public/imported tpageid in a conservative PC-compatible
-        # shape so existing texture lookup and UI code still see texture id in
-        # bits 0..12 and do not accidentally interpret PSP-only high-byte
-        # render flags as PC culling/single-sided/stencil flags.  The full PSP
-        # material state is stored separately on TextureStrip.
         return (int(texture_id) & 0x1FFF) | ((int(blend) & 0xF) << 13)
 
     @classmethod
     def _psp_primitive_env_mapping_value(cls, primitive: PSPPrimitiveInfo) -> int:
-        # PSP models do not appear to use the PC envMappedVertices index-list
-        # fields.  In observed PSP model sections, reflection is carried on the
-        # PrimitiveInfo record: the gold Lara body primitives are marked with
-        # bit 0x400 in vertex_format_flags, while non-reflective character
-        # samples only use 0x000/0x800.  The mesh builder already treats the
-        # cross-platform strip env_mapping value 64 as environment mapping.
         return cls.PSP_ENV_MAPPING_VALUE if (int(primitive.vertex_format_flags) & cls.PSP_ENV_MAPPING_FLAG) else 0
 
     def _parse_psp_primitive_info_table_with_stride(self, context: SectionContext, absolute_offset: int, stride: int) -> List[PSPPrimitiveInfo]:
@@ -136,22 +107,12 @@ class TRPSPModelParser(TRModelParser):
                 data_offset = struct.unpack_from('<I', raw, 0x0C)[0]
                 first_vertex_hint = struct.unpack_from('<H', raw, 0x10)[0]
                 bone_palette = [int(struct.unpack_from('<h', raw, 0x10 + (slot * 2))[0]) for slot in range(8)]
-                # PSP PrimitiveInfo has two known record layouts.  The older
-                # 0x9C layout stores the UV remap rectangle at +0x20.  The
-                # newer 0xA0 layout inserts one additional float before the
-                # rectangle, so its usable UV rectangle starts at +0x24.
-                # Reading newer records from +0x20 creates huge U values
-                # (for example ~43, ~117, ~132) and breaks UVs.
                 uv_rect_offset = 0x24 if int(stride) >= 0xA0 else 0x20
                 uv_rect = tuple(float(v) for v in struct.unpack_from('<4f', raw, uv_rect_offset))
 
                 mode = int(mode_word) & 0xFF
                 if vertex_count <= 0:
                     break
-                # A wrong stride usually lands on zero-mode padding/table data
-                # after the first primitive.  Stop before turning that into a
-                # bogus material/stream, but allow the scorer to compare the
-                # candidate that produced it.
                 if mode <= 0 or mode > 8:
                     break
 
@@ -185,10 +146,6 @@ class TRPSPModelParser(TRModelParser):
             return 0
         du = u1 - u0
         dv = v1 - v0
-        # Valid PSP UV remap rectangles may sit outside 0..1 for atlas/repeat
-        # usage, but they should have a sane positive extent.  This is mainly
-        # a stride tie-breaker for single-primitive sections where both 0x9C
-        # and 0xA0 produce one row.
         if du <= 0.0 or dv <= 0.0:
             return 1
         if abs(du) > 16.0 or abs(dv) > 16.0:
@@ -211,11 +168,6 @@ class TRPSPModelParser(TRModelParser):
             if field_local_offset in context.section_info.relocations_by_offset:
                 relocations += 1
             uv_rect_score += TRPSPModelParser._psp_uv_rect_score(primitive.uv_rect)
-        # Entry count and data-pointer relocations dominate.  This separates
-        # the two observed PSP layouts cleanly: 0xA0 tables have many valid
-        # relocated records in Lara/zip, while 0x9C tables have many valid
-        # relocated records in Larson.  Texture/UV checks are tie breakers for
-        # single-primitive sections where either stride lands on the same row.
         return (
             len(primitives),
             relocations,
@@ -344,28 +296,12 @@ class TRPSPModelParser(TRModelParser):
         preferred_stride = default_stride
         mode = int(primitive.mode) & 0xFF
         if mode == 1 and (not first_vertex_prefix or first_vertex_prefix[0] != 0x80):
-            # Mode-1 direct streams come in two observed layouts:
-            #   * 16 bytes, first byte 0x80: one matrix weight then UV/normal/xyz.
-            #   * 14 bytes, no weight prefix: static/rigid UV/normal/xyz.
-            # Short trailing static strips often have enough section padding to
-            # make a 16-byte record appear to fit exactly; force the no-weight
-            # interpretation when the first record does not begin with 0x80.
             preferred_stride = 14
             candidates = [14, 16, 18]
         elif mode == 2:
-            # Mode-2 is a two-weight GE layout with 16-byte records in the
-            # observed PSP samples.  Some tail streams are followed by aux table
-            # bytes, so tight-fitting 18-byte guesses read those table bytes as
-            # positions and create stray triangles.
             preferred_stride = 16
             candidates = [16, 18, 14]
 
-        # Most PSP character/object model sections keep direct primitive vertex
-        # streams in a shared geometry section, and the model-header aux pointer
-        # points to the end of that direct-stream block.  Do not use the whole
-        # target section as the final stream's bound: later bytes may be bone
-        # mirror / aux tables, and selecting a stride because it consumes those
-        # bytes tightly turns table data into random vertices.
         stream_end_offset = int(stream_end_offset or 0)
         candidate_limits = []
         for other in primitives[primitive_index + 1:]:
@@ -382,14 +318,6 @@ class TRPSPModelParser(TRModelParser):
         if stream_span <= 0 or primitive.vertex_count <= 0:
             return default_stride
 
-        # Observed PSP primitive streams usually have an 8-byte sort/header
-        # followed by packed GE vertices, then padding to a 16-byte boundary.
-        # The old heuristic chose whichever stride consumed the stream most
-        # tightly.  That breaks the last primitive in several DRM samples
-        # because the stream may be followed by section-level padding/footer
-        # bytes: a 3-vert mode-2 stream was incorrectly promoted from the
-        # 16-byte default to an 18-byte stride and read padding as xyz,
-        # producing a large stray triangle.
         header_size = max(0, int(header_size))
         preferred_required = header_size + (int(primitive.vertex_count) * int(preferred_stride))
         if preferred_required <= stream_span:
@@ -443,21 +371,12 @@ class TRPSPModelParser(TRModelParser):
 
     @classmethod
     def _psp_color_offset(cls, blob_size: int) -> int:
-        # Native PSP GE order for these records is:
-        #   weights, uv8, optional pad, color16, normal8x3, pad, xyz16x3
-        # The previously unnamed 16-bit aux value immediately before the normal
-        # carries PSP vertex lighting plus a 5-bit alpha/mask channel.
         return int(cls._psp_normal_offset(blob_size)) - 2
 
     @staticmethod
     def _decode_psp_r5g5a5_lighting(value: int) -> Tuple[int, int, int, int]:
         value = int(value) & 0xFFFF
 
-        # The 16-bit aux/color word used by these PSP model streams does not
-        # behave like ordinary RGB565 in the observed character/object samples.
-        # The upper 5 bits are kept as alpha/mask data, so they must not be
-        # borrowed as the sixth green bit; doing so creates a false green cast
-        # on models whose mask bit 10 is set.
         r5 = (value >> 0) & 0x1F
         g5 = (value >> 5) & 0x1F
         a5 = (value >> 11) & 0x1F
@@ -484,11 +403,6 @@ class TRPSPModelParser(TRModelParser):
 
     @staticmethod
     def _psp_weight_prefix_size(mode: int, blob_size: int) -> int:
-        # PSP vertex records are emitted in native GE order:
-        #   weights, uv8, optional pad for odd weight counts, aux16, normal8x3, pad, xyz16x3
-        # The previous parser padded the weight prefix before UV.  That shifted
-        # odd modes by one byte and made mode-1 16-byte records read a constant
-        # weight byte as U, collapsing the UV map into a line.
         mode = int(mode) & 0xFF
         size = int(blob_size)
         if mode <= 0:
@@ -543,17 +457,9 @@ class TRPSPModelParser(TRModelParser):
         if not influences:
             return fallback_segment, fallback_segment, -1, 0.0
 
-        # PSP records may reserve up to eight matrix-weight slots because the
-        # slot number selects an entry from PrimitiveInfo::bone_palette, but TRA
-        # PSP models observed so far only use one or two non-zero weights per
-        # vertex.  Treat additional non-zero bytes as padding/noise instead of
-        # shifting UV interpretation or creating unsupported third influences.
         if len(influences) > 2:
             influences = influences[:2]
 
-        # Preserve the first non-zero slot as the bind segment.  The PSP stream
-        # is emitted for the hardware matrix palette, so this is the closest
-        # analogue to the primary/bind segment used by the other platforms.
         primary_segment = int(influences[0][1])
         if len(influences) == 1:
             return primary_segment, primary_segment, -1, 0.0
@@ -582,9 +488,6 @@ class TRPSPModelParser(TRModelParser):
         return True
 
     def _read_psp_vertex_blob(self, blob: bytes, index: int, segment: int = 0, primitive: PSPPrimitiveInfo | None = None) -> MVertex:
-        # PSP primitive streams place signed xyz in the final three shorts of
-        # each vertex record.  The record stride varies by primitive mode:
-        # observed direct streams use 14/16/18/20/22-byte records.
         if len(blob) < 6:
             x = y = z = 0
         else:
@@ -710,11 +613,6 @@ class TRPSPModelParser(TRModelParser):
             index = int(raw_index)
             key = cls._strip_vertex_key(vertices, index) if vertices is not None else ('idx', index)
 
-            # PSP direct streams stitch several strip islands by duplicating
-            # vertex records.  Once materialized, those duplicates are different
-            # vertex indices, so an index-only degenerate check leaves long
-            # bridge triangles between islands.  Reset the strip window on a
-            # duplicated vertex key instead of only skipping the degenerate face.
             if previous_key is not None and key == previous_key:
                 window = [index]
                 previous_key = key
@@ -840,9 +738,6 @@ class TRPSPModelParser(TRModelParser):
         direct_stream_end = int(compact_vertex_base or 0)
 
         def material_group_for(primitive: PSPPrimitiveInfo, canonical_tpageid: int, env_mapping: int) -> int:
-            # Reflection, PSP blend, and PSP render-state bytes change the
-            # Blender material node graph / intended draw state, so keep them in
-            # separate material groups even when they share texture id.
             key = (
                 int(primitive.draw_group),
                 int(primitive.blend_value),
@@ -904,11 +799,6 @@ class TRPSPModelParser(TRModelParser):
                 emit_strip(primitive, source_offset, sequence, canonical_tpageid)
                 continue
 
-            # PSP PrimitiveInfo +0x0C is a relocated pointer to a
-            # primitive-local stream in the geometry section.  Observed streams
-            # start with an 8-byte sort/header pair and are followed by packed
-            # vertices; keep a fallback for any later PSP section that stores
-            # raw vertex arrays without that pair.
             header_size = 8
             if 0 <= local_offset < primitive_context.data_size:
                 header_blob = primitive_context.reader.peek(
@@ -1118,10 +1008,6 @@ class TRPSPModelParser(TRModelParser):
             pass
 
         try:
-            # PSP Model::BoneMirrorData is stored later in the model header
-            # than the PC/GC/PS2 variants.  In observed TRA PSP sections the
-            # pointer field is at +0x98 and resolves to the compact triplet
-            # stream used by the other platforms.
             bone_mirror_raw, bone_mirror_ctx, bone_mirror_abs = self._read_u32_pointer_at(cache, context, 0x98)
             if bone_mirror_abs:
                 bone_mirror_entries = self._parse_bone_mirror_entries(bone_mirror_ctx, bone_mirror_abs)
@@ -1149,12 +1035,6 @@ class TRPSPModelParser(TRModelParser):
         compact_vertex_base = 0
 
         if all_mode8:
-            # Accessory/clothing PSP model sections observed so far keep a
-            # conventional global 22-byte vertex array and use PrimitiveInfo
-            # streams as uint16 index strips.  Other all-mode-8 objects store
-            # direct primitive-local streams and leave the model-level vertex
-            # pointer null, so only enable indexed mode when a real global
-            # vertex buffer exists and the primitive streams score as indices.
             vertex_stride = 22
             has_global_vertex_buffer = bool(vertex_data_abs and int(num_vertices) > 0)
             if has_global_vertex_buffer:
@@ -1168,9 +1048,6 @@ class TRPSPModelParser(TRModelParser):
                 segment_ids = []
                 vertices = []
         else:
-            # The main Lara PSP section is mixed: PrimitiveInfo +0x0C relocates
-            # each strip directly into the geometry section.  The model-header
-            # fields around +0x24..+0x3C are not a PC-style vertex list here.
             vertex_stride = 16
             if _aux_ctx is not context:
                 vertex_data_ctx = _aux_ctx

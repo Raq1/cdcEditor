@@ -128,10 +128,6 @@ class _RootSimulationState:
     last_base_positions: list[mathutils.Vector] = field(default_factory=list)
     last_live_collision_rules_signature: str = ''
 
-    # Per-root runtime caches.  Cloth simulation is called from both the depsgraph
-    # handler and the pose-mode timer, so rebuilding FD tables and taking sqrt()s
-    # for every rule on every tick is a noticeable viewport cost.  These caches are
-    # invalidated by compact signatures derived from bone/helper metadata.
     setup_cache_key: tuple | None = None
     setup_cache: object | None = None
     prepared_distance_signature: tuple | None = None
@@ -267,12 +263,6 @@ def _evaluated_object(obj, depsgraph=None):
 
 
 def _world_radius(obj, depsgraph=None) -> float:
-    # Cloth collision radius is authored with Object Properties > Transform > Scale.
-    # Empty Data > Size is intentionally ignored so it can remain a viewport-only
-    # display setting.  Using matrix_world.to_scale() is also avoided here because
-    # the imported collision helpers often use Child Of constraints to follow
-    # bones; evaluated constraint matrices can hide or distort the local object
-    # scale that the artist is editing.
     try:
         scale_values = tuple(float(value) for value in getattr(obj, 'scale', (1.0, 1.0, 1.0)))
         if scale_values:
@@ -406,7 +396,6 @@ def _generated_setup_from_scene(
     *,
     exclude_bone_names: set[str] | None = None,
 ) -> _FDSetup | None:
-    """Generate a runtime FD setup for authored Blender cloth bones."""
     if not cloth_bones:
         return None
     exclude_bone_names = set(exclude_bone_names or set())
@@ -556,9 +545,6 @@ def _generated_setup_from_scene(
         if chain_root_is_pinned(path_names)
     }
 
-    # Export writes movable points from leaf to root, walking the sorted paths in
-    # reverse.  Matching that order is important because CollisionRule helpers
-    # and joint maps are point-index sensitive after re-import.
     for path_names in reversed_paths:
         movable_names = [name for name in path_names if int(cloth_by_name.get(name, {}).get('flags', 0)) == 4]
         for bone_name in reversed(movable_names):
@@ -681,11 +667,6 @@ def _generated_setup_from_scene(
                 next_index = int(indices[order + 1])
                 map_points = (int(current_index), int(next_index), 0, 0) if axis_code == 4 else (int(next_index), int(current_index), 0, 0)
             elif order > 0:
-                # Terminal weighted bones still need a non-degenerate map.
-                # Original game data maps the last point back to its parent
-                # neighbor, e.g. center=tip and points=(tip,parent,0,0).
-                # Previewing (tip,tip,0,0) leaves the last weighted bone with
-                # no usable FD direction.
                 previous_index = int(indices[order - 1])
                 map_points = (int(current_index), int(previous_index), 0, 0)
             else:
@@ -950,10 +931,6 @@ def _append_visible_collision_points(root, armature, setup: _FDSetup, depsgraph=
             bone_name=f'{_COLLISION_HELPER_POINT_PREFIX}{str(getattr(child, "name", "") or "")}',
         ))
         name_index = _visible_collision_helper_name_index(child)
-        # Keep the runtime setup identity structural only.  The helper position is
-        # a live base position, not topology; including it in the signature makes
-        # every modal transform invalidate the simulation state and snaps cloth
-        # bones back to their initialized/rest pose until the transform ends.
         signature_parts.append(f'{point_index}:{name_index}:{getattr(child, "name", "")}')
     if signature_parts:
         setup.signature = f'{setup.signature}|visible_collision_points:' + '|'.join(signature_parts)
@@ -1203,7 +1180,6 @@ def _collision_helper_maps_for_rule_cleanup(root) -> tuple[dict[str, object], di
 
 
 def _remove_orphaned_collision_rule_helpers() -> int:
-    """Delete per-point collision rules whose named source collision helper was deleted."""
     removed_count = 0
     root_maps: dict[int, tuple[dict[str, object], dict[int, object]]] = {}
     for rule_obj in list(getattr(bpy.data, 'objects', []) or []):
@@ -1242,15 +1218,6 @@ def _trlau_cloth_collision_rule_cleanup_timer():
 
 
 def _collision_rule_name_info(obj) -> tuple[int | None, int | None, int | None, int | None]:
-    """Return (rule_order, target_point_index, target_bone_segment, collision_index) parsed from helper name.
-
-    Imported helpers use names such as:
-        *_Cloth_CollisionRule_012_B036_P004_C010
-
-    The B### segment and C### collision helper identity are current scene data
-    encoded in the object name, not legacy custom-property fallback. P### is
-    kept only as an additional stable point hint for imported files.
-    """
     try:
         name = str(getattr(obj, 'name', '') or '')
         marker = '_Cloth_CollisionRule_'
@@ -1466,9 +1433,6 @@ def _setup_with_visible_collision_rules(root, setup: _FDSetup, armature=None) ->
             ))
 
     setup.dist_rules = new_rules
-    # Do not append the editable rule values to setup.signature. That signature
-    # controls whether Verlet state is still valid; changing a CollisionRule
-    # helper scale should update constraints live, not reinitialize the cloth.
     setup.live_collision_rules_signature = signature
     return setup
 
@@ -1950,11 +1914,6 @@ def _assign_pose_bone_matrix_basis_if_changed(pose_bone, matrix: mathutils.Matri
 
 
 def _axis_local_vector(axis_code: int) -> mathutils.Vector:
-    """Return the controlled local axis used by ClothJointMap.axis.
-
-    TRA cloth maps use 3/4/5 for the dominant segment axis (X/Y/Z).  Older
-    generated data may contain 0/1/2, so accept those as aliases.
-    """
     axis = int(axis_code)
     if axis in {0, 3}:
         return mathutils.Vector((1.0, 0.0, 0.0))
@@ -1968,13 +1927,6 @@ def _matrix_with_axis_aligned(
     local_axis: mathutils.Vector,
     target_axis_armature: mathutils.Vector,
 ) -> mathutils.Matrix | None:
-    """Rotate a pose matrix so one authored local axis points at the FD target.
-
-    The previous implementation always treated the Blender bone's +Y shaft as
-    the controlled axis.  Imported TRA joint maps often use axis 5 (local Z) or
-    axis 3 (local X).  Driving the wrong axis makes skinned cloth vertices fly
-    into a cage even when the FD points themselves are stable.
-    """
     if target_axis_armature.length <= _EPSILON:
         return None
     target = target_axis_armature.normalized()
@@ -2057,13 +2009,6 @@ def _no_basis_matrix_for_pose_bone(
     pose_source_armature=None,
     mapped_parent_matrices: dict[str, mathutils.Matrix] | None = None,
 ) -> mathutils.Matrix | None:
-    """Current armature-space matrix for the bone with its own basis removed.
-
-    Setting pose_bone.matrix directly solves for an absolute child transform and
-    can cancel the parent transform, which causes skinned cloth chains to shear
-    or explode.  FD needs local segment rotations: parent transforms should carry
-    child pivots naturally through the Blender hierarchy.
-    """
     try:
         bone = pose_bone.bone
         bone_rest = bone.matrix_local.copy()
@@ -2375,9 +2320,6 @@ def _sync_state_to_animated_pose(
             continue
         if index in movable and int(setup.points[index].flags) == 4:
             delta = base - state.rest_positions[index]
-            # Do not move simulated points all the way to the new animated rest
-            # pose.  Full shifting makes interactive pose edits look twitchy and
-            # removes the small inertial lag expected from FD cloth.
             shifted = delta * follow_strength
             state.positions[index] += shifted
             state.previous_positions[index] += shifted
@@ -2504,18 +2446,12 @@ def _solve_fd_step(
     *,
     fast_preview: bool = False,
 ) -> tuple[list[mathutils.Vector], list[mathutils.Vector]]:
-    # Full-quality playback still uses the original 6x18 projection budget.
-    # Interactive same-frame pose updates use a smaller budget; those updates arrive
-    # at timer/depsgraph frequency and are immediately corrected on the next frame.
     if fast_preview:
         substeps = 3
         iterations = 10
     else:
         substeps = 6
         iterations = 18
-    # TRA's values are authored in game-frame units, not Blender seconds. Keep
-    # frame_delta in frames so gravity=10 has roughly the same order of magnitude
-    # as the imported point distances.
     step_dt = max(0.0, min(1.0, float(frame_delta))) / max(1, substeps)
     drag_scale = max(0.0, min(1.0, 1.0 - float(drag))) ** (1.0 / max(1, substeps))
     gravity_step = gravity * (step_dt * step_dt)
@@ -2548,10 +2484,6 @@ def _solve_fd_step(
         pin_fixed_points(current, previous)
         _stabilize_positions(current, previous, base_positions, movable, motion_limits, movable_indices)
 
-        # Keep non-movable points aligned to the current animated pose before and
-        # during constraint projection. This is the game-style meaning of pinned:
-        # it is an animated attachment point, while mapped bones can still rotate
-        # because their other points are dynamic.
         pin_fixed_points(current)
 
         for _iteration in range(iterations):
@@ -2559,9 +2491,6 @@ def _solve_fd_step(
                 _apply_prepared_distance_rule(current, rule, stiffness=1.0)
             if has_external_colliders:
                 _apply_external_collisions(current, movable_indices, spheres, capsules)
-                # Keep the Verlet previous position out of colliders as well.  If
-                # only the current point is projected out, the next frame sees the
-                # projection as velocity and the cloth bounces/jitters vertically.
                 _apply_external_collisions(previous, movable_indices, spheres, capsules)
             _stabilize_positions(current, previous, base_positions, movable, motion_limits, movable_indices)
             pin_fixed_points(current, previous)
@@ -2592,9 +2521,6 @@ def _simulate_root(scene, root, depsgraph=None, *, interactive: bool = False) ->
     else:
         frame_delta = current_frame - float(last_frame)
         if abs(frame_delta) <= 1.0e-5:
-            # Blender can call frame_change_post more than once for the same
-            # timeline frame while playback is active.  Treating that as a reset
-            # makes cloth alternate between rest and simulated poses.
             same_frame = True
             frame_delta = 0.0
         elif frame_delta < 0.0 or frame_delta > 2.0:
@@ -2628,12 +2554,6 @@ def _simulate_root(scene, root, depsgraph=None, *, interactive: bool = False) ->
         # pose or hard-resetting to rest.
         _sync_state_to_animated_pose(state, setup, base_positions, movable, follow_strength=0.68)
     elif interactive and not live_collision_rules_changed:
-        # An unrelated pose-bone transform can still make Blender re-evaluate the
-        # whole armature and momentarily display cloth bones from their keyed/rest
-        # pose.  Re-apply the last solved cloth pose instead of returning without
-        # touching the mapped bones.  Pose-bone writes below are idempotent, so
-        # this does not create a self-triggered depsgraph loop when nothing really
-        # changed.
         output_positions = state.output_positions if len(state.output_positions) == len(setup.points) else state.positions
         _apply_joint_maps(armature, setup, output_positions, state.rest_positions, set(cloth_bones.keys()), reset=True, depsgraph=depsgraph)
         return
@@ -2756,9 +2676,6 @@ def _active_pose_mode_needs_cloth_refresh(scene) -> bool:
 
 
 def _trlau_cloth_pose_mode_timer():
-    # Cloth preview is playback-gated by the Preview Cloth button.  Keep this
-    # function as a safe no-op for sessions that may still have the timer
-    # registered from a previous addon version.
     return 0.25
 
 

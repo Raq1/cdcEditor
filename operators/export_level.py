@@ -22,6 +22,7 @@ from ..core.material_ui import decode_tpage_flags, get_material_tpageid, get_mat
 from ..core.texture_export import clear_texture_export_cache, image_to_pcd_bytes
 from ..core.fsfx_render_effect import build_fsfx_render_effect_content_from_object, has_fsfx_render_effect_properties
 from ..core.cine_format import build_cine_payload_from_metadata
+from ..core.level_combat import decode_combat_graph, patch_combat_graph
 from ..platforms.pc.tr7ae_model_export import TRLAUModelExporter
 from ..platforms.ps2.tr7ae_model_export import TRLAUPS2ModelExporter
 from ..platforms.pc.area_dbase import (
@@ -44,6 +45,7 @@ from ..ui.level_panel import (
     SFX_SOUND_PERIODIC_FIELDS,
     SFX_SOUND_EVENT_FIELDS,
     SFX_SOUND_STREAM_FIELDS,
+    trlau_level_combat_property_to_dict,
 )
 from ..platforms.pc.tr7ae_level_export import (
     ExportCollision,
@@ -94,6 +96,7 @@ _ARMATURE_ENUM_CACHE: list[tuple[str, str, str]] = []
 SECTION_BLOB_PROP_PREFIX = 'trlau_section_blob_'
 TERRAIN_LIGHT_GRID_BLOB_PROP_PREFIX = 'trlau_terrain_light_grid_blob_'
 BGOBJECT_BLOB_PROP_PREFIX = 'trlau_bgobject_blob_'
+COMBAT_BLOB_PROP_PREFIX = 'trlau_combat_blob_'
 MARKUP_FLAG_PERCH = 262144
 MARKUP_FLAG_WATER = 2147483648
 MARKUP_BBOX_FLAGS = MARKUP_FLAG_PERCH | MARKUP_FLAG_WATER
@@ -220,8 +223,35 @@ def _enum_animation_armature_items(_self=None, context=None):
     return _ARMATURE_ENUM_CACHE
 
 
+def _trlau_filepath_suffix(filepath: str) -> str:
+    text = str(filepath or '').replace('\\', '/')
+    name = text.rsplit('/', 1)[-1]
+    dot = name.rfind('.')
+    if dot <= 0:
+        return ''
+    return name[dot:].lower()
+
+
+def _trlau_replace_filepath_suffix(filepath: str, desired_ext: str) -> str:
+    text = str(filepath or '')
+    desired_ext = str(desired_ext or '')
+    if desired_ext and not desired_ext.startswith('.'):
+        desired_ext = '.' + desired_ext
+
+    slash = max(text.rfind('/'), text.rfind('\\'))
+    dot = text.rfind('.')
+    if dot > slash:
+        text = text[:dot]
+    return bpy.path.ensure_ext(text, desired_ext)
+
+
+def _trlau_filepath_name(filepath: str) -> str:
+    text = str(filepath or '').replace('\\', '/').rstrip('/')
+    return text.rsplit('/', 1)[-1] if text else ''
+
+
 def _is_animation_export_filepath(filepath: str) -> bool:
-    return Path(str(filepath or '')).suffix.lower() == '.ani'
+    return _trlau_filepath_suffix(filepath) == '.ani'
 
 
 def _active_armature(context):
@@ -347,13 +377,13 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
 
         collection = bpy.data.collections.get(self.collection_name)
         if self._is_model_export_collection(collection):
-            if self.filepath and Path(self.filepath).suffix.lower() not in {'.obj', '.drm'}:
+            if self.filepath and _trlau_filepath_suffix(self.filepath) not in {'.obj', '.drm'}:
                 source_drm = TRLAUModelExporter.find_source_drm_for_collection(collection)
                 desired_ext = '.drm' if source_drm is not None else '.obj'
-                self.filepath = bpy.path.ensure_ext(str(Path(self.filepath).with_suffix('')), desired_ext)
+                self.filepath = _trlau_replace_filepath_suffix(self.filepath, desired_ext)
                 return True
-        elif self.filepath and Path(self.filepath).suffix.lower() != '.drm':
-            self.filepath = bpy.path.ensure_ext(str(Path(self.filepath).with_suffix('')), '.drm')
+        elif self.filepath and _trlau_filepath_suffix(self.filepath) != '.drm':
+            self.filepath = _trlau_replace_filepath_suffix(self.filepath, '.drm')
             return True
         return False
 
@@ -444,12 +474,12 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             if self._is_model_export_collection(collection):
                 exporter_cls = TRLAUPS2ModelExporter if TRLAUPS2ModelExporter.collection_is_ps2_model(collection) else TRLAUModelExporter
                 exporter = exporter_cls(debug=bool(self.debug))
-                suffix = Path(self.filepath).suffix.lower()
+                suffix = _trlau_filepath_suffix(self.filepath)
                 if suffix == '.drm':
                     written = exporter.export_collection_to_drm(context, collection, self.filepath, export_textures=bool(self.export_textures), export_cloth=bool(self.export_cloth))
                     for message in getattr(exporter, 'warnings', []) or []:
                         self.report({'WARNING'}, message)
-                    self.report({'INFO'}, f'Exported TRLAU model DRM: {Path(self.filepath).name}')
+                    self.report({'INFO'}, f'Exported TRLAU model DRM: {_trlau_filepath_name(self.filepath)}')
                     return {'FINISHED'}
                 if suffix == '.obj':
                     written = exporter.export_collection(context, collection, self.filepath, export_textures=bool(self.export_textures), export_cloth=bool(self.export_cloth))
@@ -476,7 +506,7 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             self.report({'ERROR'}, f'TRLAU export failed: {exc}')
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f'Exported TRLAU level DRM: {Path(self.filepath).name}')
+        self.report({'INFO'}, f'Exported TRLAU level DRM: {_trlau_filepath_name(self.filepath)}')
         return {'FINISHED'}
 
     def _build_export_level(self, context, collection: Collection, *, export_textures: bool = True, export_area_dbase: bool = True) -> ExportLevel:
@@ -512,6 +542,7 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
 
         metadata = self._gather_root_metadata(root)
         unit_data = self._gather_unit_data_metadata(collection, root)
+        combat_data = self._gather_combat_data_metadata(collection, root)
         admd_data = self._gather_component_metadata(collection, root, 'ADMDData', 'trlau_type', 'ADMDData', 'trlau_admd_empty', 'trlau_admd_')
         passthrough_sections = self._gather_passthrough_sections(collection, root, metadata, unit_data, export_area_dbase=export_area_dbase)
         if export_textures:
@@ -535,6 +566,7 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             metadata=metadata,
             unit_data=unit_data,
             admd_data=admd_data,
+            combat_data=combat_data,
             scene_center_offset=self._extract_scene_center_offset(root),
             passthrough_sections=passthrough_sections,
             game=level_game,
@@ -1613,7 +1645,8 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             except Exception:
                 index = 0
             try:
-                section_index = int(obj.get('trlau_cine_section_index', obj.get('trlau_unitdata_cine_section_index', -1)) or -1)
+                raw_section_index = obj.get('trlau_cine_section_index', obj.get('trlau_unitdata_cine_section_index', -1))
+                section_index = -1 if raw_section_index is None else int(raw_section_index)
             except Exception:
                 section_index = -1
             try:
@@ -1634,6 +1667,45 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             })
         entries.sort(key=lambda entry: (int(entry.get('index', 0) or 0), str(entry)))
         return entries
+
+    @staticmethod
+    def _gather_combat_data_metadata(collection: Collection, root) -> Optional[dict[str, object]]:
+        combat_obj = EXPORT_SCENE_OT_trlau_level._find_component_empty(
+            collection,
+            root,
+            'CombatData',
+            'trlau_type',
+            'CombatData',
+            'trlau_combat_data_empty',
+        )
+        if combat_obj is None:
+            return None
+        try:
+            chunk_count = int(combat_obj.get('trlau_combat_blob_chunk_count', 0) or 0)
+        except Exception:
+            chunk_count = 0
+        if chunk_count <= 0:
+            return None
+        encoded = ''.join(str(combat_obj.get(f'{COMBAT_BLOB_PROP_PREFIX}{index:04d}', '') or '') for index in range(chunk_count))
+        if not encoded:
+            return None
+        try:
+            blob = base64.b64decode(encoded.encode('ascii'))
+        except Exception:
+            logger.warning('Failed to decode embedded combat metadata for %s', getattr(combat_obj, 'name', '<unknown>'))
+            return None
+        graph = decode_combat_graph(blob)
+        if not graph:
+            logger.warning('Embedded combat metadata for %s is invalid', getattr(combat_obj, 'name', '<unknown>'))
+            return None
+        if int(graph.get('version', 0) or 0) < 3:
+            raise ValueError(
+                'This scene contains legacy embedded combat data that does not include PMarker and global spline-camera links. '
+                'Re-import the original DRM with the current addon before exporting.'
+            )
+        editor_data = trlau_level_combat_property_to_dict(combat_obj)
+        patch_combat_graph(graph, editor_data)
+        return graph
 
     @staticmethod
     def _gather_unit_data_metadata(collection: Collection, root) -> Optional[dict[str, object]]:
@@ -1781,7 +1853,12 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
         return cells
 
     @staticmethod
-    def _parse_passthrough_section_blob(blob: bytes, export_name: str, override_section_id: Optional[int] = None) -> Optional[ExportPassthroughSection]:
+    def _parse_passthrough_section_blob(
+        blob: bytes,
+        export_name: str,
+        override_section_id: Optional[int] = None,
+        original_section_index: int = -1,
+    ) -> Optional[ExportPassthroughSection]:
         if len(blob) < 24 or blob[:4] not in {b'SECT', b'DRM\x00'}:
             return None
         try:
@@ -1820,6 +1897,7 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             has_debug_info=int(packed_data & 0x1),
             resource_type=int((packed_data >> 1) & 0x7F),
             spec_mask=int(spec_mask),
+            original_section_index=int(original_section_index),
             relocations=relocations,
         )
 
@@ -1973,7 +2051,21 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
     @staticmethod
     def _parse_passthrough_section(obj, export_name: str, override_section_id: Optional[int] = None) -> Optional[ExportPassthroughSection]:
         blob = EXPORT_SCENE_OT_trlau_level._decode_section_blob(obj)
-        section = EXPORT_SCENE_OT_trlau_level._parse_passthrough_section_blob(blob, export_name, override_section_id=override_section_id)
+        original_section_index = EXPORT_SCENE_OT_trlau_level._int_prop(obj, 'trlau_section_original_index', -1)
+        if original_section_index < 0:
+            # Backward compatibility for scenes imported before the explicit
+            # property existed. Extracted section files are named INDEX_ID.ext.
+            file_name = str(EXPORT_SCENE_OT_trlau_level._object_prop(obj, 'trlau_section_file_name', '') or '')
+            try:
+                original_section_index = int(Path(file_name).stem.split('_', 1)[0])
+            except Exception:
+                original_section_index = -1
+        section = EXPORT_SCENE_OT_trlau_level._parse_passthrough_section_blob(
+            blob,
+            export_name,
+            override_section_id=override_section_id,
+            original_section_index=original_section_index,
+        )
         if section is not None and has_fsfx_render_effect_properties(obj):
             try:
                 section.data = build_fsfx_render_effect_content_from_object(obj, section.data)
@@ -2177,7 +2269,7 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             header_offset = 0x10
         if header_offset < 0:
             header_offset = 0x10
-        return None, header_offset, None
+        return 0, header_offset, None
 
     @staticmethod
     def _find_area_dbase_empty(collection: Collection, root):
@@ -2270,6 +2362,50 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
         if area_obj is None:
             return None
 
+        use_embedded_source = bool(area_obj.get('trlau_area_dbase_use_embedded_source', True))
+        embedded_blob = EXPORT_SCENE_OT_trlau_level._decode_section_blob(area_obj) if use_embedded_source else b''
+        if embedded_blob:
+            embedded_section = EXPORT_SCENE_OT_trlau_level._parse_passthrough_section_blob(
+                embedded_blob,
+                'area_dbase',
+            )
+            if embedded_section is None:
+                logger.warning('Embedded AreaDBase section on %s is invalid; rebuilding from the mesh instead', getattr(area_obj, 'name', '<unknown>'))
+            elif embedded_section.relocations:
+                logger.warning(
+                    'Embedded AreaDBase section on %s has %d unresolved relocation(s); rebuilding from the mesh instead',
+                    getattr(area_obj, 'name', '<unknown>'),
+                    len(embedded_section.relocations),
+                )
+            else:
+                try:
+                    move_offset = int(metadata.get('areaDBaseMoveDataOffset', 0))
+                except Exception:
+                    move_offset = 0
+                try:
+                    planner_offset = int(metadata.get('areaDBasePlannerDataOffset', 0x10))
+                except Exception:
+                    planner_offset = 0x10
+                try:
+                    runtime_area_dbase_offset = int(metadata.get('areaDBaseRuntimeObjectOffset', -1))
+                except Exception:
+                    runtime_area_dbase_offset = -1
+                try:
+                    header_content_offset = int(metadata.get('areaDBaseHeaderContentOffset', planner_offset))
+                except Exception:
+                    header_content_offset = planner_offset
+                metadata['areaDBaseSectionName'] = str(embedded_section.name)
+                metadata['areaDBaseMoveDataOffset'] = int(move_offset)
+                metadata['areaDBasePlannerDataOffset'] = int(planner_offset)
+                metadata['areaDBaseRuntimeObjectOffset'] = int(runtime_area_dbase_offset)
+                metadata['areaDBaseHeaderContentOffset'] = int(header_content_offset)
+                logger.info(
+                    'Exporting lossless embedded AreaDBase section from %s (%d bytes)',
+                    getattr(area_obj, 'name', '<unknown>'),
+                    len(embedded_section.data),
+                )
+                return embedded_section
+
         mesh_obj = EXPORT_SCENE_OT_trlau_level._find_area_dbase_mesh(area_obj)
         if mesh_obj is None:
             logger.warning('Skipping AreaDBase export: %s has no AreaDBase_Areas mesh', getattr(area_obj, 'name', '<unknown>'))
@@ -2312,7 +2448,7 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
 
         _move_offset, planner_offset, runtime_area_dbase_offset = EXPORT_SCENE_OT_trlau_level._area_dbase_pointer_offsets_for_header(header_content_offset)
         metadata['areaDBaseSectionName'] = str(section.name)
-        metadata['areaDBaseMoveDataOffset'] = -1
+        metadata['areaDBaseMoveDataOffset'] = int(_move_offset) if _move_offset is not None else -1
         metadata['areaDBasePlannerDataOffset'] = int(planner_offset) if planner_offset is not None else int(header_content_offset)
         metadata['areaDBaseRuntimeObjectOffset'] = int(runtime_area_dbase_offset) if runtime_area_dbase_offset is not None else -1
         metadata['areaDBaseHeaderContentOffset'] = int(header_content_offset)
@@ -2329,7 +2465,8 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             if not bool(obj.get('trlau_unitdata_fsfx_link_empty')):
                 continue
             try:
-                obj_index = int(obj.get('trlau_unitdata_fsfx_index', -1) or -1)
+                raw_index = obj.get('trlau_unitdata_fsfx_index', -1)
+                obj_index = -1 if raw_index is None else int(raw_index)
             except Exception:
                 obj_index = -1
             if obj_index == int(index):
@@ -2361,7 +2498,8 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
             if not bool(obj.get('trlau_unitdata_cine_empty')):
                 continue
             try:
-                obj_index = int(obj.get('trlau_unitdata_cine_index', -1) or -1)
+                raw_index = obj.get('trlau_unitdata_cine_index', -1)
+                obj_index = -1 if raw_index is None else int(raw_index)
             except Exception:
                 obj_index = -1
             if obj_index == int(index):
@@ -2470,7 +2608,8 @@ class EXPORT_SCENE_OT_trlau_level(Operator, ExportHelper):
                 except Exception:
                     cine_index = int(entry_index)
                 try:
-                    cine_section_index = int(entry.get('section_index', -1) or -1)
+                    raw_section_index = entry.get('section_index', -1)
+                    cine_section_index = -1 if raw_section_index is None else int(raw_section_index)
                 except Exception:
                     cine_section_index = -1
                 try:

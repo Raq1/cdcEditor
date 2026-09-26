@@ -50,13 +50,6 @@ class TRPS2ModelParser(TRModelParser):
 
     @staticmethod
     def _canonicalize_ps2_tpageid(raw_tpageid: int) -> int:
-        """Convert observed PS2 tpage packing to the shared material layout.
-
-        The UI deliberately uses the same tpage field names as PC.  PS2 stores
-        the texture section id in 16 bits instead of PC's 13-bit texture id, so
-        the higher fields are shifted by three bits when importing/exporting.
-        The raw imported word is not kept as hidden material export state.
-        """
         raw = int(raw_tpageid) & 0xFFFFFFFF
 
         texture_id = raw & 0xFFFF
@@ -65,10 +58,6 @@ class TRPS2ModelParser(TRModelParser):
         canonical = texture_id & 0x1FFF
         canonical |= (blend_value & 0xF) << 13
 
-        # PS2 does not use the PC bit-21 Single Sided field.  Raw bit 31
-        # controls double-sided rendering: 0 = single sided, 1 = double sided.
-        # Keep the raw bits 20..22 field as an editable render mode instead of
-        # treating value 2 as culling.
         render_mode = (raw >> 20) & 0x7
         double_sided = (raw >> 31) & 0x1
         canonical |= (render_mode & 0x7) << 17   # PS2 render mode
@@ -294,10 +283,6 @@ class TRPS2ModelParser(TRModelParser):
         material_group_by_key: dict[tuple[int, int], int] = {}
 
         def material_group_for(draw_group: int, canonical_tpageid: int) -> int:
-            # PS2 PrimitiveInfo is one draw primitive per entry, but Blender
-            # should not need one material per primitive.  Merge material slots
-            # by the decoded/canonical tpage id while keeping drawgroups
-            # separate so visibility and drawgroup material controls still work.
             key = (int(draw_group), int(canonical_tpageid) & 0xFFFFFFFF)
             material_group = material_group_by_key.get(key)
             if material_group is None:
@@ -447,18 +432,6 @@ class TRPS2ModelParser(TRModelParser):
         cache: SectionContextCache,
         context: SectionContext,
     ) -> List[BoneMirrorEntry]:
-        """Read the compact PS2 bone-mirror table without disturbing parsing.
-
-        In PS2 TR7A meshes this pointer has been observed at model-header
-        offset 0x6C.  The payload is a compact triplet stream: bone1, bone2,
-        count, terminated by two zero bytes.  Example from 20_0.tr7aemesh
-        points 0x6C -> local 0xBC.
-
-        This routine deliberately restores both readers it may touch.  The
-        shared compact-table parser advances the section reader, and PS2 model
-        import continues reading the model header immediately after this call.
-        Leaving the reader at the mirror table corrupts the rest of the import.
-        """
         source_previous = context.reader.tell()
         mirror_previous = None
         mirror_ctx = context
@@ -584,14 +557,6 @@ class TRPS2ModelParser(TRModelParser):
             segments,
             virt_segments,
         )
-        # Keep the compact virtual-segment table that was actually stored in the
-        # PS2 model.  Earlier first-pass code replaced it with one generated
-        # entry per weighted vertex so Blender could recover weights, but that
-        # corrupts round-trip skeleton export: PS2 skeleton data expects the
-        # original compact Segment/VirtSegment table, not a synthesized PC-style
-        # table.  Vertex weights are already preserved on each imported MVertex
-        # via gc_primary_segment/gc_secondary_segment/gc_secondary_weight, so the
-        # generated table is only a fallback for malformed/segmentless files.
         if output_virt_segments and not virt_segments:
             virt_segments = output_virt_segments
 

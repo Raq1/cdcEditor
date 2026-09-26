@@ -25,7 +25,15 @@ from .texture import (
 from ...core.log import logger
 from ...core.cine_format import cine_name_from_section, parse_cine_payload
 from ...core.material_ui import make_material_name_from_tpageid, initialize_material_flag_properties, material_uses_vertex_colors, set_material_panel_value
+from ...core.level_combat import ROOT_COMBAT_FIELDS, rebuild_combat_summary
 from ..common.section import SectionContext, SectionContextCache, resolve_pointer
+
+def _int_or(value, default=0):
+    try:
+        return int(default) if value is None else int(value)
+    except Exception:
+        return int(default)
+
 
 _LEVEL_VERSION = 0x04C204BB
 _UV_SCALE = 0.00024414062
@@ -721,6 +729,7 @@ class LevelData:
     terrain_signal_list_context: Optional[SectionContext] = None
     bg_objects: List[BGObject] = field(default_factory=list)
     bg_instances: List[BGInstance] = field(default_factory=list)
+    combat_data: dict[str, object] = field(default_factory=dict)
 
 
 
@@ -2864,6 +2873,138 @@ class TRLevelParser:
         )
 
     @staticmethod
+    def _capture_raw_combat_data(raw_reader: _RawBinaryReader, raw_sections: _RawSectionList) -> dict[str, object]:
+        sections = list(getattr(raw_sections, 'sections', []) or [])
+        if not sections:
+            return {}
+        root = sections[0]
+        root_start = int(getattr(root, 'offset', 0) or 0)
+        root_size = int(getattr(root, 'size', 0) or 0)
+        root_data = bytes(raw_reader.data[root_start:root_start + root_size])
+        if len(root_data) < 0xD0:
+            return {}
+
+        def relocation_record(section, raw_entry):
+            type_and_section_info, type_specific, source_offset = raw_entry
+            source_offset = int(source_offset)
+            target_section = int(type_and_section_info) >> 3
+            relocation_type = int(type_and_section_info) & 0x7
+            section_start = int(getattr(section, 'offset', 0) or 0)
+            section_size = int(getattr(section, 'size', 0) or 0)
+            if source_offset < 0 or source_offset + 4 > section_size:
+                raw_target = 0
+            else:
+                raw_target = int(struct.unpack_from('<I', raw_reader.data, section_start + source_offset)[0])
+            return {
+                'source_offset': source_offset,
+                'target_section': target_section,
+                'target_offset': raw_target,
+                'relocation_type': relocation_type,
+                'type_specific': int(type_specific),
+            }
+
+        root_relocations = [relocation_record(root, entry) for entry in list(getattr(root, 'raw_relocations', []) or [])]
+        relocation_by_offset = {int(entry['source_offset']): entry for entry in root_relocations}
+        root_fields: list[dict[str, object]] = []
+        root_targets: set[int] = set()
+        pending_external: set[int] = set()
+        for field_name, field_offset in ROOT_COMBAT_FIELDS:
+            relocation = relocation_by_offset.get(int(field_offset))
+            if relocation is None:
+                continue
+            target_section = _int_or(relocation.get('target_section'), -1)
+            target_offset = _int_or(relocation.get('target_offset'), 0)
+            if target_section < 0 or target_section >= len(sections):
+                continue
+            root_fields.append({
+                'name': str(field_name),
+                'field_offset': int(field_offset),
+                'target_section': target_section,
+                'target_offset': target_offset,
+                'relocation_type': _int_or(relocation.get('relocation_type'), 0),
+                'type_specific': _int_or(relocation.get('type_specific'), 0),
+            })
+            if target_section == 0:
+                root_targets.add(target_offset)
+            else:
+                pending_external.add(target_section)
+        if not root_fields:
+            return {}
+
+        external_indices: set[int] = set()
+        external_relocations: dict[int, list[dict[str, object]]] = {}
+
+        def collect_external(section_index: int) -> None:
+            section_index = int(section_index)
+            if section_index == 0 or section_index in external_indices:
+                return
+            if section_index < 0 or section_index >= len(sections):
+                return
+            external_indices.add(section_index)
+            section = sections[section_index]
+            records = [relocation_record(section, entry) for entry in list(getattr(section, 'raw_relocations', []) or [])]
+            external_relocations[section_index] = records
+            for record in records:
+                target_index = _int_or(record.get('target_section'), -1)
+                target_offset = _int_or(record.get('target_offset'), 0)
+                if target_index == 0:
+                    root_targets.add(target_offset)
+                elif 0 < target_index < len(sections):
+                    collect_external(target_index)
+
+        for section_index in sorted(pending_external):
+            collect_external(section_index)
+
+        processed_tail_start: int | None = None
+        root_tail_relocations: list[dict[str, object]] = []
+        while root_targets:
+            valid_root_targets = [int(value) for value in root_targets if int(value) >= 0]
+            if not valid_root_targets:
+                break
+            tail_start = min(valid_root_targets)
+            if tail_start < 0 or tail_start >= root_size:
+                break
+            if processed_tail_start is not None and tail_start >= processed_tail_start:
+                break
+            processed_tail_start = tail_start
+            root_tail_relocations = [record for record in root_relocations if _int_or(record.get('source_offset'), -1) >= tail_start]
+            for record in root_tail_relocations:
+                target_index = _int_or(record.get('target_section'), -1)
+                target_offset = _int_or(record.get('target_offset'), 0)
+                if target_index == 0:
+                    root_targets.add(target_offset)
+                elif 0 < target_index < len(sections):
+                    collect_external(target_index)
+
+        graph: dict[str, object] = {
+            'version': 3,
+            'root_fields': root_fields,
+            'root_tail_start': int(processed_tail_start) if processed_tail_start is not None else -1,
+            'root_tail_data': root_data[int(processed_tail_start):] if processed_tail_start is not None else b'',
+            'root_tail_relocations': root_tail_relocations,
+            'sections': [],
+        }
+        for section_index in sorted(external_indices):
+            section = sections[section_index]
+            section_start = int(getattr(section, 'offset', 0) or 0)
+            section_size = int(getattr(section, 'size', 0) or 0)
+            graph['sections'].append({
+                'source_index': int(section_index),
+                'base_offset': 0,
+                'section_type': int(getattr(section, 'type', 0) or 0),
+                'section_id': int(getattr(section, 'id', 0) or 0),
+                'skip_flags': int(getattr(section, 'skip_flags', 0) or 0),
+                'version_id': int(getattr(section, 'version_id', 0) or 0),
+                'has_debug_info': int(getattr(section, 'has_debug_info', 0) or 0),
+                'resource_type': int(getattr(section, 'resource_type', 0) or 0),
+                'spec_mask': int(getattr(section, 'spec_mask', 0xFFFFFFFF) or 0xFFFFFFFF),
+                'data': bytes(raw_reader.data[section_start:section_start + section_size]),
+                'relocations': list(external_relocations.get(section_index, []) or []),
+            })
+        rebuild_combat_summary(graph)
+        return graph
+
+    @staticmethod
     def _read_extracted_reloc_module(cache: SectionContextCache, context: SectionContext) -> Optional[RelocModuleData]:
         try:
             context.reader.seek(context.data_start + 0x9C)
@@ -2920,6 +3061,7 @@ class TRLevelParser:
         self.level_cdc_render_data_id = int(getattr(level, 'cdc_render_data_id', 0))
         level.source_game = self._normalize_level_game(self.game_hint or self._detect_drm_game(sections))
         level.reloc_module = self._read_raw_drm_reloc_module(type_check_reader, type_sections)
+        level.combat_data = self._capture_raw_combat_data(type_check_reader, type_sections)
         self._populate_drm_level_metadata(reader, sections, root_section, level)
         self._populate_raw_intro_data_blocks(reader, level)
         self._populate_raw_bginstance_multi_spline_data(reader, level)
@@ -4293,9 +4435,32 @@ class TRLevelParser:
         player_name_offset = reader.read_u32()
         metadata['playerName'] = self._read_c_string(reader, player_name_offset)
         reader.read_u32()  # levelCount
-        reader.read_u32()  # moveData
-        reader.read_u32()  # pCdcPlannerData
-        reader.read_u32()  # pAreaDBase
+        move_data_offset = reader.read_u32()
+        planner_data_offset = reader.read_u32()
+        runtime_area_dbase_offset = reader.read_u32()
+
+        area_pointer_values = (
+            ('areaDBaseMoveDataOffset', int(move_data_offset)),
+            ('areaDBasePlannerDataOffset', int(planner_data_offset)),
+            ('areaDBaseRuntimeObjectOffset', int(runtime_area_dbase_offset)),
+        )
+        area_section = None
+        for metadata_key, absolute_pointer in area_pointer_values:
+            target_section = self._find_raw_section_by_absolute_offset(sections, absolute_pointer)
+            if target_section is None:
+                continue
+            if area_section is None:
+                area_section = target_section
+            if target_section is area_section:
+                metadata[metadata_key] = int(absolute_pointer) - int(target_section.offset)
+        if area_section is not None:
+            try:
+                metadata['areaDBaseSourceSectionIndex'] = int(sections.sections.index(area_section))
+            except ValueError:
+                pass
+            if 'areaDBasePlannerDataOffset' in metadata:
+                metadata['areaDBaseHeaderContentOffset'] = int(metadata['areaDBasePlannerDataOffset'])
+
         unit_data_offset = reader.read_u32()
         unit_data_section = self._find_raw_section_by_absolute_offset(sections, unit_data_offset)
         level.unit_data = self._parse_unit_data_blob(reader.data, unit_data_offset, getattr(level, 'source_game', self.game_hint), section_id=getattr(unit_data_section, 'id', None), parse_pointer_arrays=True, raw_sections=sections)
@@ -6436,7 +6601,6 @@ class TRLevelBuilder:
 
 
     def _build_terrain_group_mesh_object(self, level: LevelData, group: TerrainGroup, parent: Optional[bpy.types.Object] = None) -> Optional[bpy.types.Object]:
-        """Build one editable terrain mesh for a TerrainGroup, using one material slot per original strip."""
         vertices: List[Tuple[float, float, float]] = []
         local_uvs: List[Tuple[float, float]] = []
         vertex_colors: List[Tuple[int, int, int, int]] = []

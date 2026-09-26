@@ -195,9 +195,6 @@ class TRObjectParser:
                     )
                     return refs
 
-        # Last-resort scan: find a short contiguous run of relocated pointer
-        # fields near the object header.  This avoids using the much larger
-        # texture/object dependency tables later in the root section.
         reloc_by_offset = context.section_info.relocations_by_offset
         candidate_counts = [num_models] if num_models else []
         candidate_counts.extend([count for count in range(1, 17) if count not in candidate_counts])
@@ -243,11 +240,6 @@ class TRObjectParser:
 
     @staticmethod
     def _find_file_by_id(directory: Path, file_id: int) -> Path | None:
-        # TR8 section IDs are not globally unique in every DRM.  For example,
-        # lara.drm contains multiple extracted sections named *_352.*.  The object
-        # root points to the earliest section-table occurrence, while a plain
-        # lexicographic sort can pick 1616_352 before 3_352.  Collect all matches
-        # and prefer the lowest numeric section index.
         id_hex = TRObjectParser._normalise_hex_id(file_id).lower()
         id_hex_no_zero = id_hex.lstrip('0') or '0'
         matches: list[Path] = []
@@ -316,13 +308,6 @@ class TRObjectParser:
             return None
 
     def _parse_underworld_objectref_ids(self, cache: SectionContextCache, objectref_context) -> list[int]:
-        """Read the TR8 object-reference root section.
-
-        TR9 objectref files are documented as a single RefDefinitions block plus
-        one Ref.  TR8/Underworld PC DRMs seen so far use a simpler root section:
-        a small contiguous list of resource/file IDs at the start of the payload.
-        Those IDs may reference several object-ish files, not just one object.
-        """
         ids: list[int] = []
         root_id = self._section_file_id(objectref_context)
         max_words = min(64, max(0, objectref_context.data_size // 4))
@@ -374,20 +359,9 @@ class TRObjectParser:
         return ids
 
     def _parse_underworld_object_model_ids(self, cache: SectionContextCache, object_context) -> list[int]:
-        """Read model resource IDs from a TR8 object section.
-
-        In the supplied TR8 Lara DRM, the object's render/model list is stored as:
-          local +0xA0 = model count
-          local +0xA4 = pointer to a u32 model-resource-ID array
-        Keep a relocation-backed validation pass so unrelated files referenced by
-        the objectref section are ignored instead of treated as objects.
-        """
         directory = Path(object_context.filepath).parent
         candidates: list[tuple[int, int]] = [(0xA0, 0xA4)]
 
-        # Conservative fallback: look for a small count immediately followed by a
-        # relocated pointer.  This covers minor TR8 layout drift without scanning
-        # unrelated large tables deep in the object file.
         for count_offset in range(0x40, min(0x140, object_context.data_size - 8), 4):
             pointer_offset = count_offset + 4
             if pointer_offset not in object_context.section_info.relocations_by_offset:
@@ -450,13 +424,6 @@ class TRObjectParser:
         return best_ids
 
     def _parse_underworld_modeldata_id(self, model_context) -> int | None:
-        """Read the cdcModelData/tr8mesh resource ID from a TR8 model section.
-
-        TR8 differs from the TR9 template's direct RefDefinitions-style model data
-        ref.  The Lara sample stores the cdcModelData resource ID at local +0x64.
-        The surrounding model header begins with the same 0x04C20453 signature seen
-        in multiple model entries, so validate that before accepting the ID.
-        """
         magic = self._read_context_u32_safe(model_context, 0x00)
         if magic != 0x04C20453:
             logger.debug('TR8 model candidate %s rejected: unexpected magic 0x%X', model_context.file_name, int(magic or 0))
@@ -561,7 +528,6 @@ class TRObjectParser:
             cache.close()
 
     def parse_cloth_setups(self):
-        """Parse ClothSetup records referenced by Object.rdSetupList."""
         return TRClothParser(self.filepath, endian=self.endian).parse()
 
     def parse_model_references(self) -> List[ObjectModelReference]:

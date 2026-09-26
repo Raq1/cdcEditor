@@ -449,7 +449,6 @@ def _is_inside_cloth_authoring_root(obj) -> bool:
 
 @dataclass(slots=True)
 class _SyntheticClothRoot:
-    """Transient cloth root used when bones are authored as cloth but no Cloth empty exists."""
 
     name: str
     parent: object
@@ -461,7 +460,6 @@ class _SyntheticClothRoot:
         return self.props.get(key, default)
 
 class TRLAUModelExporter:
-    """Export edited regular model sections back to an extracted TRLAU folder."""
 
     def __init__(self, *, debug: bool = False):
         self.debug = bool(debug)
@@ -474,15 +472,6 @@ class TRLAUModelExporter:
         logger.warning(message)
 
     def _snapshot_export_component_world_matrices(self, collection) -> Dict[int, Matrix]:
-        """Capture authoring helper transforms before export forces armatures to REST.
-
-        Model geometry is exported from rest pose, but helper components are
-        authored in the visible scene.  Cloth collision helpers and HInfo
-        objects can have Child Of constraints; if we read their matrix_world
-        after switching armatures to REST, their positions are silently
-        recomputed.  Store their pre-export world matrices so export writes the
-        positions the user actually has in the scene.
-        """
         result: Dict[int, Matrix] = {}
         if collection is None:
             return result
@@ -664,14 +653,6 @@ class TRLAUModelExporter:
             return 0.0
 
     def _build_cloth_setup_from_root(self, root) -> ClothSetup:
-        """Build a ClothSetup from the scene authoring state.
-
-        The authoring contract is intentionally small: bones are either pinned
-        or unpinned, and collision points are sphere objects under the Cloth
-        empty. Everything that is specific to the Forward Dynamics setup
-        (point indices, joint maps, distance constraints, and move rules) is
-        regenerated here from the armature graph and sphere placement.
-        """
         setup = ClothSetup()
         setup.gravity = 10.0
         setup.drag = 0.1
@@ -684,11 +665,6 @@ class TRLAUModelExporter:
         path_axis_by_root_index: dict[int, int] = {}
         path_names_by_root_index: dict[int, list[str]] = {}
 
-        # The exporter now generates ClothSetup tables from the visible scene
-        # state instead of consulting imported setup JSON/offset metadata stored on
-        # the Cloth empty.  Imported per-point collision helpers resolve by name
-        # and by position, and pinned-only points are represented by pinned bones
-        # with trlau_cloth_enabled=False.
         imported_points_hint: list[dict] = []
         imported_point_index_by_bone_segment: dict[int, int] = {}
         imported_collision_point_indices: set[int] = set()
@@ -1423,11 +1399,6 @@ class TRLAUModelExporter:
             collision_key_by_name[str(getattr(child, 'name', '') or '')] = str(key)
 
 
-        # Imported setups can use a pinned ClothPoint as a collision anchor
-        # (flags=5, but used by min-distance rules like a fixed collision point).
-        # Represent that with a visible ClothPinCollision helper and resolve it
-        # back to the existing pinned bone point here, instead of creating a new
-        # flags=1 collision point or relying on the removed setup JSON.
         for child in list(getattr(root, 'children', []) or []):
             if getattr(child, 'type', None) not in {'MESH', 'EMPTY'}:
                 continue
@@ -1518,9 +1489,6 @@ class TRLAUModelExporter:
                 marker_value = int(default)
             if marker_value == 0:
                 return 0
-            # FDPlaneRule references use signed HMarker stored indices.  The
-            # original PC data uses negative references for these cloth planes,
-            # so authored positive indices are normalized to that convention.
             if marker_value > 0:
                 marker_value = -marker_value
             return max(-32768, min(32767, int(marker_value)))
@@ -1744,14 +1712,6 @@ class TRLAUModelExporter:
             return scored
 
         def _plane_rule_explicit_marker_pair(child):
-            """Resolve the authored marker pair from live plane-face constraints.
-
-            This is still scene-derived authoring data, not a copied imported
-            FDPlaneRule list: each ClothPlaneRulePlane follows an actual HMarker.
-            Prefer that explicit relationship over nearest-marker scoring so
-            user-created plane rules remain stable when several HMarkers are
-            close together.
-            """
             resolved: list[int] = []
             seen: set[int] = set()
 
@@ -2089,11 +2049,6 @@ class TRLAUModelExporter:
                     next_index = int(indices[order + 1])
                     map_points = (int(current_index), int(next_index), 0, 0) if axis_code == 4 else (int(next_index), int(current_index), 0, 0)
                 elif order > 0:
-                    # Terminal weighted bones still need a non-degenerate map.
-                    # Original game data maps the last point back to its parent
-                    # neighbor, e.g. center=tip and points=(tip,parent,0,0).
-                    # Exporting (tip,tip,0,0) leaves the last weighted bone with
-                    # no usable FD direction.
                     previous_index = int(indices[order - 1])
                     map_points = (int(current_index), int(previous_index), 0, 0)
                 else:
@@ -2136,14 +2091,6 @@ class TRLAUModelExporter:
         ]
 
         def collision_rule_min_dist_sq(movable_index: int, collision_index: int, order: int, total: int) -> float:
-            """Generate the normal/default collision lower bound.
-
-            Per-point ClothCollisionRule helpers add exact authored lower bounds
-            for specific point/collider pairs.  They should not replace the base
-            ClothCollision radius.  The default collision rule therefore stays
-            the editable collision empty radius squared, matching the v10
-            behavior that was less stiff.
-            """
             collision_entry = point_entries[int(collision_index)]
             radius = max(0.0, float(collision_entry.get('radius', 0.0) or 0.0))
             return float(radius * radius)
@@ -2162,9 +2109,6 @@ class TRLAUModelExporter:
                 if int(target_index) not in path_set:
                     continue
                 collision_entry = point_entries[int(collision_index)]
-                # Some assets use a pinned point as a fixed collision anchor.  In
-                # those files the pin-collision rules appear after the pin anchor
-                # stretch rules, not with normal flags=1 collider rules.
                 if int(collision_entry.get('flags', 0)) == 5:
                     deferred_pin_collision_rules.append((int(target_index), int(collision_index), float(min_dist_sq), float(max_dist_sq)))
                     continue
@@ -2305,10 +2249,6 @@ class TRLAUModelExporter:
                 return existing.name
             return str(listed) if listed else None
 
-        # Prefer the current object section's RDSetup relocation target.  Older
-        # versions stored this as trlau_cloth_section_index on the Cloth empty,
-        # but that made imported Cloth empties noisy.  The object section already
-        # contains the authoritative pointer, so derive it during export.
         try:
             object_section = read_standalone_section(object_path)
             for reloc in list(getattr(object_section, 'relocations', []) or []):
@@ -2598,13 +2538,6 @@ class TRLAUModelExporter:
         return written
 
     def export_collection_to_drm(self, context, collection, drm_filepath: str, *, source_drm_filepath: str | None = None, export_textures: bool = True, export_cloth: bool = True) -> List[Path]:
-        """Export a regular model collection directly into a DRM container.
-
-        The regular model writer still needs an object-section template. For a
-        DRM target, use an existing/source DRM as that template, extract it into
-        a scoped temporary directory, rewrite the edited model/texture sections,
-        then repack every section into the requested DRM path.
-        """
         target_path = Path(drm_filepath)
         if target_path.suffix.lower() != '.drm':
             raise ValueError('Direct model DRM export requires a .drm target path')
@@ -2634,7 +2567,6 @@ class TRLAUModelExporter:
 
     @staticmethod
     def find_source_drm_for_collection(collection, target_path: str | Path | None = None) -> Optional[Path]:
-        """Infer the original/source DRM for a model collection when possible."""
         if target_path is not None:
             candidate = Path(target_path)
             if candidate.suffix.lower() == '.drm' and candidate.exists():
@@ -3047,7 +2979,7 @@ class TRLAUModelExporter:
                     strip_buffer.pack_at(previous_next_field, '<I', entry_offset)
                     strip_buffer.relocations.append(_Relocation(target, previous_next_field))
                 vertex_count = len(chunk_indices)
-                header = struct.pack('<hhiffI', int(vertex_count), draw_group, int(strip.tpageid) & 0xFFFFFFFF, float(strip.sort_push), float(strip.scroll_offset), 0)
+                header = struct.pack('<hhIffI', int(vertex_count), draw_group, int(strip.tpageid) & 0xFFFFFFFF, float(strip.sort_push), float(strip.scroll_offset), 0)
                 strip_buffer.data.extend(header)
                 previous_next_field = entry_offset + 16
                 for index in chunk_indices:
@@ -3465,6 +3397,7 @@ class TRLAUModelExporter:
         vertices, faces, strips, vertex_colors, virt_segments, env_indices, eye_ref_indices, vertex_weights = self._collect_mesh_geometry(context, model_root, arm_obj, mesh_objects, segments, pivot_by_segment, model_scale)
         self._validate_model_vertex_limit(model_root, vertices)
         segments = self._finalize_segment_bounds(segments, vertices, vertex_weights, pivot_by_segment, model_scale)
+        self._validate_pc_mface_declaration_layout(segments, virt_segments, vertices, vertex_weights, faces)
         return ModelData(
             version=_PC_MODEL_VERSION_MAGIC,
             model_scale=model_scale,
@@ -3631,9 +3564,6 @@ class TRLAUModelExporter:
                 max_abs[0] = max(max_abs[0], abs(float(rel.x)))
                 max_abs[1] = max(max_abs[1], abs(float(rel.y)))
                 max_abs[2] = max(max_abs[2], abs(float(rel.z)))
-        # Use the modelScale fields as quantization factors. Choosing them from
-        # the scene-space per-axis extents keeps signed 16-bit vertex positions
-        # in range while using as much precision as the format allows.
         result = []
         for axis in range(3):
             if max_abs[axis] <= 1e-9:
@@ -3670,10 +3600,6 @@ class TRLAUModelExporter:
         if not self._is_ps2_export_context():
             return None
 
-        # PS2 model ST values are signed 4096-scale coordinates.  Always encode
-        # from the authored Blender UV layer; do not use hidden/raw UV mesh
-        # attributes.  Direct float -> PS2 ST encoding keeps edited UVs usable
-        # and avoids the PC half-float quantization path.
         if uv is not None:
             return (_encode_ps2_scaled_uv_component(float(uv.x)), _encode_ps2_scaled_uv_component(1.0 - float(uv.y)))
         return (0, 0)
@@ -3719,22 +3645,36 @@ class TRLAUModelExporter:
 
             mface_group_key_by_local_vertex: Dict[int, tuple] = {}
             vertex_base_data: Dict[int, tuple[tuple[int, int, int], tuple[int, int, float]]] = {}
+            arm_local_by_local_vertex: Dict[int, Vector] = {}
+            weight_by_local_vertex: Dict[int, tuple[int, int, float]] = {}
+            segment_count_for_weights = max(1, len(segments or []))
+
             for src_vertex in mesh.vertices:
                 local_vertex_index = int(src_vertex.index)
-                primary, secondary, secondary_weight = self._vertex_segment_weights(mesh_obj, local_vertex_index, arm_obj, overweight_stats)
-                primary = max(0, min(primary, max(0, len(segments) - 1)))
-                if secondary >= 0:
-                    secondary = max(0, min(secondary, max(0, len(segments) - 1)))
-                    if secondary == primary or secondary_weight <= 1e-6:
-                        secondary = -1
-                        secondary_weight = 0.0
+                primary, secondary, secondary_weight = self._normalize_export_weight(
+                    self._vertex_segment_weights(mesh_obj, local_vertex_index, arm_obj, overweight_stats),
+                    segment_count_for_weights,
+                )
                 world = mesh_obj.matrix_world @ src_vertex.co
                 arm_local = arm_inv @ world
+                arm_local_by_local_vertex[local_vertex_index] = arm_local
+                weight_by_local_vertex[local_vertex_index] = (int(primary), int(secondary), float(secondary_weight))
                 if mface_group_by_local_vertex:
-                    mface_height_by_local_vertex[int(local_vertex_index)] = float(getattr(arm_local, 'z', 0.0))
-                pivot = pivot_by_segment.get(primary, Vector((0.0, 0.0, 0.0)))
+                    mface_height_by_local_vertex[local_vertex_index] = float(getattr(arm_local, 'z', 0.0))
+
+            # Encode each position relative to the primary/bind segment selected
+            # from that vertex's own Blender weights.  Do not let MFace authoring
+            # alter the skin transform.
+            for src_vertex in mesh.vertices:
+                local_vertex_index = int(src_vertex.index)
+                primary, secondary, secondary_weight = weight_by_local_vertex.get(local_vertex_index, (0, -1, 0.0))
+                arm_local = arm_local_by_local_vertex.get(local_vertex_index, Vector((0.0, 0.0, 0.0)))
+                pivot = pivot_by_segment.get(int(primary), Vector((0.0, 0.0, 0.0)))
                 raw = Vector(((arm_local.x - pivot.x) / sx, (arm_local.y - pivot.y) / sy, (arm_local.z - pivot.z) / sz))
-                vertex_base_data[local_vertex_index] = ((_int16(raw.x), _int16(raw.y), _int16(raw.z)), (primary, secondary, secondary_weight))
+                vertex_base_data[local_vertex_index] = (
+                    (_int16(raw.x), _int16(raw.y), _int16(raw.z)),
+                    (int(primary), int(secondary), float(secondary_weight)),
+                )
 
             used_loops_by_vertex: Dict[int, List[int]] = defaultdict(list)
             for tri in getattr(mesh, 'loop_triangles', []) or []:
@@ -3781,13 +3721,6 @@ class TRLAUModelExporter:
                     variants.add((int(uvx), int(uvy), normal_raw, color if has_color_attr else None))
                 return max(1, len(variants))
 
-            # An authored MFacePoint can span vertices that must be ordered in
-            # different export buckets because of bone/weight data. SameVertBits
-            # ranges must remain consecutive and can store at most 31 vertices,
-            # so split the authored point automatically by the normalized export
-            # weight bucket and then into 31-safe chunks when needed. This keeps
-            # the user-facing grouping broad while emitting encodable runtime
-            # ranges.
             if mface_group_by_local_vertex:
                 owner_name = str(getattr(mesh_obj, 'name', '') or getattr(mesh, 'name', 'Mesh'))
                 point_heights: Dict[int, List[float]] = defaultdict(list)
@@ -3840,9 +3773,6 @@ class TRLAUModelExporter:
                             auto_chunked_groups += 1
                         mface_group_key_by_local_vertex[int(local_vertex_index)] = (*base_key, int(chunk_index))
                         chunk_count += int(variant_count)
-                # Oversized MFace runtime ranges are silently chunked to fit the
-                # 5-bit SameVertBits field. This is an internal export fix, not
-                # something that should show up as an export warning/report.
 
                 local_vertex_order.sort(key=lambda vertex_index: (mface_group_key_by_local_vertex.get(int(vertex_index), (owner_name, 0, 0, 0, -1, 0.0, 0)), int(vertex_index)))
 
@@ -3996,18 +3926,85 @@ class TRLAUModelExporter:
         virt_segments = self._build_virt_segments(vertices, vertex_weights, segments, pivot_by_segment, model_scale)
         return vertices, faces, strips, vertex_colors if any_vertex_color else None, virt_segments, env_indices, eye_ref_indices, vertex_weights
 
+    def _synchronize_mface_point_weights(
+        self,
+        mface_group_by_local_vertex: Dict[int, int],
+        weight_by_local_vertex: Dict[int, tuple[int, int, float]],
+        segment_count: int,
+    ) -> Dict[int, tuple[int, int, float]]:
+        result: Dict[int, tuple[int, int, float]] = {
+            int(vertex_index): self._normalize_export_weight(weight_tuple, segment_count)
+            for vertex_index, weight_tuple in (weight_by_local_vertex or {}).items()
+        }
+        if not mface_group_by_local_vertex:
+            return result
+
+        members_by_point: Dict[int, List[int]] = defaultdict(list)
+        for local_vertex_index, point_index in mface_group_by_local_vertex.items():
+            local_vertex_index = int(local_vertex_index)
+            if local_vertex_index in result:
+                members_by_point[int(point_index)].append(local_vertex_index)
+
+        for _point_index, members in members_by_point.items():
+            members = sorted(set(int(index) for index in members))
+            if len(members) <= 1:
+                continue
+
+            entries: List[tuple[int, tuple[int, int, float]]] = []
+            for local_vertex_index in members:
+                normalized = self._normalize_export_weight(result[local_vertex_index], segment_count)
+                entries.append((local_vertex_index, normalized))
+
+            weighted_entries = [
+                entry
+                for entry in entries
+                if int(entry[1][1]) >= 0 and 1e-6 < float(entry[1][2]) < 1.0 - 1e-6
+            ]
+            candidate_entries = weighted_entries if weighted_entries else entries
+
+            counts: Dict[tuple[int, int, float], int] = defaultdict(int)
+            first_index: Dict[tuple[int, int, float], int] = {}
+            representative: Dict[tuple[int, int, float], tuple[int, int, float]] = {}
+            for local_vertex_index, weight_tuple in candidate_entries:
+                primary, secondary, weight = self._normalize_export_weight(weight_tuple, segment_count)
+                key = (int(primary), int(secondary), round(float(weight), 6))
+                counts[key] += 1
+                first_index.setdefault(key, int(local_vertex_index))
+                representative.setdefault(key, (int(primary), int(secondary), float(weight)))
+
+            if not counts:
+                continue
+            selected_key = min(
+                counts.keys(),
+                key=lambda key: (-int(counts[key]), int(first_index.get(key, 0)), key),
+            )
+            selected = representative[selected_key]
+            for local_vertex_index in members:
+                result[local_vertex_index] = selected
+
+        return result
+
     def _normalize_export_weight(self, weight_tuple: tuple[int, int, float], segment_count: int) -> tuple[int, int, float]:
         try:
             primary, secondary, weight = weight_tuple
         except Exception:
             primary, secondary, weight = 0, -1, 0.0
-        primary = max(0, min(int(primary), max(0, int(segment_count) - 1)))
+        max_segment = max(0, int(segment_count) - 1)
+        primary = max(0, min(int(primary), max_segment))
         secondary = int(secondary)
         weight = max(0.0, min(1.0, float(weight)))
         if secondary >= 0:
-            secondary = max(0, min(secondary, max(0, int(segment_count) - 1)))
+            secondary = max(0, min(secondary, max_segment))
         if secondary < 0 or secondary == primary or weight <= 1e-6:
             return int(primary), -1, 0.0
+
+        weight = max(0.0, min(1.0, float(weight)))
+        if weight <= 1e-6:
+            return int(primary), -1, 0.0
+        if weight >= 1.0 - 1e-6:
+            # The lower-index secondary owns effectively all influence. A fully
+            # weighted two-bone VirtSegment is unnecessary; bind directly to it.
+            return int(secondary), -1, 0.0
         return int(primary), int(secondary), float(weight)
 
     def _estimate_virt_segment_count_from_weights(self, vertex_weights: Sequence[tuple[int, int, float]], segments: Sequence[Segment]) -> int:
@@ -4139,9 +4136,6 @@ class TRLAUModelExporter:
         final_count = original_count
         strategy_notes: List[str] = []
 
-        # Always remove precision noise for Flat Shading. This intentionally
-        # turns imported values like 0.05098 into 0.05, even when the current
-        # VirtSegment count is already under the hard limit.
         for step in _MODEL_FLAT_SHADED_WEIGHT_STEPS:
             candidate = self._quantize_flat_shaded_weights(normalized, segment_count, float(step))
             candidate_count = self._estimate_virt_segment_count_from_weights(candidate, segments)
@@ -4209,10 +4203,6 @@ class TRLAUModelExporter:
         if not pair_stats:
             return [self._normalize_export_weight(weight_tuple, segment_count) for weight_tuple in vertex_weights]
 
-        # If there are already more bone pairs than the game allows as virtual
-        # segments, keep the most visually significant pairs. A weight near
-        # 0.0 or 1.0 is cheap to bake to a single bone, while a 0.5 blend is
-        # more expensive to lose.
         sorted_pairs = sorted(
             pair_stats,
             key=lambda pair: (float(pair_stats[pair]['impact']), len(pair_stats[pair]['indices'])),
@@ -4390,16 +4380,57 @@ class TRLAUModelExporter:
                 pass
             return (0, str(group), 0, -1, -1, 0.0, 0)
 
+        weight_rank_by_key: Dict[tuple[int, int, float], int] = {}
+        next_weight_rank_by_pair: Dict[tuple[int, int], int] = defaultdict(int)
+        for old_index in range(len(vertices)):
+            primary, secondary, weight = normalized_weight(old_index)
+            if secondary < 0 or secondary == primary or weight <= 1e-6:
+                continue
+            rounded_weight = round(float(weight), 6)
+            key = (int(primary), int(secondary), rounded_weight)
+            pair = (int(primary), int(secondary))
+            if key not in weight_rank_by_key:
+                weight_rank_by_key[key] = int(next_weight_rank_by_pair[pair])
+                next_weight_rank_by_pair[pair] += 1
+
         def sort_key(old_index: int) -> tuple:
             primary, secondary, weight = normalized_weight(old_index)
-            is_weighted = 1 if secondary >= 0 and weight > 1e-6 else 0
-            return (primary, is_weighted, secondary if is_weighted else -1, round(weight, 6) if is_weighted else 0.0, mface_sort_key(old_index), old_index)
+            is_weighted = secondary >= 0 and secondary != primary and weight > 1e-6
+            if not is_weighted:
+                return (0, int(primary), mface_sort_key(old_index), int(old_index))
+            rounded_weight = round(float(weight), 6)
+            weight_rank = int(weight_rank_by_key.get((int(primary), int(secondary), rounded_weight), 0))
+            return (
+                1,
+                int(primary),
+                int(secondary),
+                weight_rank,
+                mface_sort_key(old_index),
+                int(old_index),
+            )
 
         ordered_old_indices = sorted(range(len(vertices)), key=sort_key)
         old_to_new = {old_index: new_index for new_index, old_index in enumerate(ordered_old_indices)}
 
+        mface_groups_by_face: List[Tuple[tuple, tuple, tuple]] = []
         if mface_group_by_vertex_index:
-            new_indices_by_group: Dict[tuple[str, int], List[int]] = defaultdict(list)
+            for face in faces or []:
+                try:
+                    groups = (
+                        mface_group_by_vertex_index[int(face.v0)],
+                        mface_group_by_vertex_index[int(face.v1)],
+                        mface_group_by_vertex_index[int(face.v2)],
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        'Could not rebuild an MFace declaration from the current mesh; '
+                        'one of its generated corners has no final MFacePoint group.'
+                    ) from exc
+                mface_groups_by_face.append(groups)
+
+        final_mface_range_by_group: Dict[tuple, Tuple[int, int]] = {}
+        if mface_group_by_vertex_index:
+            new_indices_by_group: Dict[tuple, List[int]] = defaultdict(list)
             for old_index, group in mface_group_by_vertex_index.items():
                 if int(old_index) not in old_to_new:
                     continue
@@ -4407,16 +4438,36 @@ class TRLAUModelExporter:
             for group, new_indices in new_indices_by_group.items():
                 if not new_indices:
                     continue
-                ordered = sorted(new_indices)
+                ordered = sorted(set(int(index) for index in new_indices))
                 if ordered[-1] - ordered[0] + 1 != len(ordered):
                     raise ValueError(
                         f'MFace point group {group!r} does not remain contiguous after bone/weight export ordering. '
                         'Split that MFace point by segment/weight, or keep all render vertices assigned to it on the same segment/weight.'
                     )
+                if len(ordered) > 31:
+                    raise ValueError(
+                        f'MFace point group {group!r} exports to {len(ordered)} vertices; SameVertBits can store at most 31.'
+                    )
+                final_mface_range_by_group[group] = (int(ordered[0]), int(len(ordered)))
 
         if all(old_index == new_index for new_index, old_index in enumerate(ordered_old_indices)):
             for index, vertex in enumerate(vertices):
                 vertex.index = index
+            if mface_group_by_vertex_index:
+                rebuilt_faces: List[MFace] = []
+                for face_index, _face in enumerate(faces or []):
+                    if face_index >= len(mface_groups_by_face):
+                        raise ValueError('Generated MFace topology lost a declaration while rebuilding final indices.')
+                    groups = mface_groups_by_face[face_index]
+                    try:
+                        ranges = [final_mface_range_by_group[group] for group in groups]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f'Generated MFace point {exc.args[0]!r} has no final contiguous declaration range.'
+                        ) from exc
+                    same_bits = (ranges[0][1] & 0x1F) | ((ranges[1][1] & 0x1F) << 5) | ((ranges[2][1] & 0x1F) << 10)
+                    rebuilt_faces.append(MFace(index=len(rebuilt_faces), v0=ranges[0][0], v1=ranges[1][0], v2=ranges[2][0], same_vert_bits=int(same_bits) & 0xFFFF))
+                faces = rebuilt_faces
             return vertices, vertex_colors, [normalized_weight(index) for index in range(len(vertices))], faces, strips, env_indices, eye_ref_indices
 
         reordered_vertices: List[MVertex] = []
@@ -4431,14 +4482,29 @@ class TRLAUModelExporter:
             reordered_weights.append(normalized_weight(old_index))
 
         remapped_faces: List[MFace] = []
-        for face_index, face in enumerate(faces or []):
-            try:
-                v0 = old_to_new[int(face.v0)]
-                v1 = old_to_new[int(face.v1)]
-                v2 = old_to_new[int(face.v2)]
-            except Exception:
-                continue
-            remapped_faces.append(MFace(index=face_index, v0=v0, v1=v1, v2=v2, same_vert_bits=int(face.same_vert_bits) & 0xFFFF))
+        if mface_group_by_vertex_index:
+            for face_index, _face in enumerate(faces or []):
+                if face_index >= len(mface_groups_by_face):
+                    raise ValueError('Generated MFace topology lost a declaration while rebuilding final indices.')
+                groups = mface_groups_by_face[face_index]
+                try:
+                    ranges = [final_mface_range_by_group[group] for group in groups]
+                except KeyError as exc:
+                    raise ValueError(
+                        f'Generated MFace point {exc.args[0]!r} has no final contiguous declaration range.'
+                    ) from exc
+                v0, v1, v2 = (int(ranges[0][0]), int(ranges[1][0]), int(ranges[2][0]))
+                same_bits = (int(ranges[0][1]) & 0x1F) | ((int(ranges[1][1]) & 0x1F) << 5) | ((int(ranges[2][1]) & 0x1F) << 10)
+                remapped_faces.append(MFace(index=len(remapped_faces), v0=v0, v1=v1, v2=v2, same_vert_bits=int(same_bits) & 0xFFFF))
+        else:
+            for face in faces or []:
+                try:
+                    v0 = old_to_new[int(face.v0)]
+                    v1 = old_to_new[int(face.v1)]
+                    v2 = old_to_new[int(face.v2)]
+                except Exception:
+                    continue
+                remapped_faces.append(MFace(index=len(remapped_faces), v0=v0, v1=v1, v2=v2, same_vert_bits=int(face.same_vert_bits) & 0xFFFF))
 
         for strip in strips or []:
             strip.indices = [old_to_new[int(index)] for index in list(getattr(strip, 'indices', []) or []) if int(index) in old_to_new]
@@ -4451,8 +4517,10 @@ class TRLAUModelExporter:
     def _build_virt_segments(self, vertices: Sequence[MVertex], vertex_weights: Sequence[tuple[int, int, float]], segments: Sequence[Segment], pivot_by_segment: Dict[int, Vector], model_scale: Sequence[float]) -> List[VirtSegment]:
         virt_segments: List[VirtSegment] = []
         sx, sy, sz = (float(model_scale[0] or 1.0), float(model_scale[1] or 1.0), float(model_scale[2] or 1.0))
-        run_start = None
-        run_key = None
+        run_start: Optional[int] = None
+        run_key: Optional[tuple[int, int, float]] = None
+        seen_weighted = False
+        previous_pair: Optional[tuple[int, int]] = None
 
         def same_key(a, b) -> bool:
             if a is None or b is None:
@@ -4460,13 +4528,20 @@ class TRLAUModelExporter:
             return int(a[0]) == int(b[0]) and int(a[1]) == int(b[1]) and abs(float(a[2]) - float(b[2])) <= 1e-5
 
         def flush_run(end_index: int) -> None:
-            nonlocal run_start, run_key
+            nonlocal run_start, run_key, previous_pair
             if run_start is None or run_key is None:
                 return
             primary, secondary, weight = run_key
+            pair = (int(primary), int(secondary))
+            if previous_pair is not None and pair < previous_pair:
+                raise ValueError(
+                    f'VirtSegment pair order regressed from {previous_pair[0]}/{previous_pair[1]} '
+                    f'to {pair[0]}/{pair[1]}; weighted declarations must be sorted by primary/secondary segment.'
+                )
+            previous_pair = pair
             virt_index = len(virt_segments)
             scaled_positions = []
-            for vertex_index in range(run_start, end_index + 1):
+            for vertex_index in range(int(run_start), int(end_index) + 1):
                 vertex = vertices[vertex_index]
                 vertex.segment = len(segments) + virt_index
                 x, y, z = vertex.position_raw
@@ -4475,23 +4550,46 @@ class TRLAUModelExporter:
             primary_pivot = pivot_by_segment.get(int(primary), Vector((0.0, 0.0, 0.0)))
             secondary_pivot = pivot_by_segment.get(int(secondary), Vector((0.0, 0.0, 0.0)))
             pivot = primary_pivot - secondary_pivot
-            virt_segments.append(VirtSegment(virt_index=virt_index, min_v=min_v, max_v=max_v, pivot=(float(pivot.x), float(pivot.y), float(pivot.z), 1.0), flags=8, first_vertex=int(run_start), last_vertex=int(end_index), index=int(primary), weight_index=int(secondary), weight=max(0.0, min(1.0, float(weight)))))
+            virt_segments.append(
+                VirtSegment(
+                    virt_index=virt_index,
+                    min_v=min_v,
+                    max_v=max_v,
+                    pivot=(float(pivot.x), float(pivot.y), float(pivot.z), 1.0),
+                    flags=8,
+                    first_vertex=int(run_start),
+                    last_vertex=int(end_index),
+                    index=int(primary),
+                    weight_index=int(secondary),
+                    weight=max(0.0, min(1.0, float(weight))),
+                )
+            )
             run_start = None
             run_key = None
 
-        for vertex_index, (primary, secondary, weight) in enumerate(vertex_weights):
-            if secondary < 0 or secondary == primary or weight <= 1e-6:
+        segment_count = max(1, len(segments or []))
+        for vertex_index, weight_tuple in enumerate(vertex_weights):
+            primary, secondary, weight = self._normalize_export_weight(weight_tuple, segment_count)
+            is_weighted = secondary >= 0 and secondary != primary and weight > 1e-6
+            if not is_weighted:
+                if seen_weighted:
+                    raise ValueError(
+                        f'Rigid Segment declaration {vertex_index} appears after the VirtSegment tail began. '
+                        'PC TR7/TRA requires all rigid declarations before all two-weight declarations.'
+                    )
                 vertices[vertex_index].segment = int(primary)
-                flush_run(vertex_index - 1)
                 continue
+
+            seen_weighted = True
             key = (int(primary), int(secondary), round(float(weight), 6))
             if run_start is None:
-                run_start = vertex_index
+                run_start = int(vertex_index)
                 run_key = key
             elif not same_key(key, run_key):
-                flush_run(vertex_index - 1)
-                run_start = vertex_index
+                flush_run(int(vertex_index) - 1)
+                run_start = int(vertex_index)
                 run_key = key
+
         flush_run(len(vertices) - 1)
         return virt_segments
 
@@ -4514,31 +4612,13 @@ class TRLAUModelExporter:
         clean = [(int(index), float(weight)) for index, weight in weighted_segments if float(weight) > 1e-6]
         if not clean:
             return (0, -1, 0.0)
-        # The PC model format supports exactly two effective weights per
-        # vertex: the vertex segment plus one secondary VirtSegment weight.
-        # Keep the two strongest Blender weights and discard the rest before
-        # choosing which of the pair should be the primary/bind segment.
         clean.sort(key=lambda item: (-item[1], item[0]))
         clean = clean[:_MODEL_MAX_WEIGHTS_PER_VERTEX]
         if len(clean) == 1:
             return (clean[0][0], -1, 0.0)
-        # TR7/TRA PC model vertices can reference only one base segment plus
-        # one secondary weighted segment through a VirtSegment. Keep the two
-        # strongest weights, but choose the bind/primary segment by skeleton
-        # ancestry rather than by largest weight. Imported files often have a
-        # secondary weight greater than 0.5; using the largest group as primary
-        # flips the original VirtSegment.index/weightIndex pair.
         first, second = clean[0], clean[1]
-        a, aw = first
-        b, bw = second
-        if self._bone_is_ancestor(arm_obj, a, b):
-            primary, primary_weight, secondary, secondary_raw_weight = a, aw, b, bw
-        elif self._bone_is_ancestor(arm_obj, b, a):
-            primary, primary_weight, secondary, secondary_raw_weight = b, bw, a, aw
-        elif a <= b:
-            primary, primary_weight, secondary, secondary_raw_weight = a, aw, b, bw
-        else:
-            primary, primary_weight, secondary, secondary_raw_weight = b, bw, a, aw
+        primary, primary_weight = first
+        secondary, secondary_raw_weight = second
         total = max(primary_weight + secondary_raw_weight, 1e-9)
         secondary_weight = secondary_raw_weight / total
         if secondary_weight <= 1e-6:
@@ -4583,41 +4663,248 @@ class TRLAUModelExporter:
     def _finalize_segment_bounds(self, segments: List[Segment], vertices: Sequence[MVertex], vertex_weights: Sequence[tuple[int, int, float]], pivot_by_segment: Dict[int, Vector], model_scale: Sequence[float]) -> List[Segment]:
         sx, sy, sz = (float(model_scale[0] or 1.0), float(model_scale[1] or 1.0), float(model_scale[2] or 1.0))
         by_segment: Dict[int, List[MVertex]] = defaultdict(list)
+        indices_by_segment: Dict[int, List[int]] = defaultdict(list)
+        segment_count = max(1, len(segments or []))
+
         for vertex_index, vertex in enumerate(vertices):
             if 0 <= vertex_index < len(vertex_weights):
-                segment_index = int(vertex_weights[vertex_index][0])
+                primary, secondary, weight = self._normalize_export_weight(vertex_weights[vertex_index], segment_count)
             else:
-                segment_index = int(vertex.segment)
+                primary, secondary, weight = int(vertex.segment), -1, 0.0
+            if secondary >= 0 and secondary != primary and weight > 1e-6:
+                # Weighted declarations belong exclusively to VirtSegments.
+                continue
+            segment_index = int(primary)
             if 0 <= segment_index < len(segments):
                 by_segment[segment_index].append(vertex)
+                indices_by_segment[segment_index].append(int(vertex_index))
+
         result: List[Segment] = []
+        previous_last = -1
         for segment in segments:
-            verts = by_segment.get(int(segment.index), [])
+            segment_index = int(segment.index)
+            verts = by_segment.get(segment_index, [])
+            indices = indices_by_segment.get(segment_index, [])
             if verts:
+                first = min(indices)
+                last = max(indices)
+                if last - first + 1 != len(indices):
+                    raise ValueError(
+                        f'Rigid PC vertex declarations for Segment {segment_index} are not contiguous '
+                        f'({first}-{last}, {len(indices)} declarations).'
+                    )
+                if first != previous_last + 1:
+                    raise ValueError(
+                        f'Rigid PC Segment declaration ranges are not contiguous: Segment {segment_index} '
+                        f'begins at {first}, expected {previous_last + 1}.'
+                    )
+                previous_last = int(last)
                 scaled_positions = []
                 for vertex in verts:
                     x, y, z = vertex.position_raw
                     scaled_positions.append((float(x) * sx, float(y) * sy, float(z) * sz))
                 min_v, max_v = self._bounds_from_scaled_positions(scaled_positions)
-                first = min(v.index for v in verts)
-                last = max(v.index for v in verts)
             else:
                 min_v = (0.0, 0.0, 0.0, 0.0)
                 max_v = (0.0, 0.0, 0.0, 0.0)
                 first = 0
                 last = -1
-            result.append(Segment(index=segment.index, min_v=min_v, max_v=max_v, pivot=segment.pivot, flags=segment.flags, first_vertex=first, last_vertex=last, parent=segment.parent, hinfo=0))
+            result.append(
+                Segment(
+                    index=segment.index,
+                    min_v=min_v,
+                    max_v=max_v,
+                    pivot=segment.pivot,
+                    flags=segment.flags,
+                    first_vertex=first,
+                    last_vertex=last,
+                    parent=segment.parent,
+                    hinfo=0,
+                )
+            )
         return result
 
-    def _mface_embedded_data(self, mesh_obj, mesh) -> tuple[Dict[int, int], List[Tuple[int, int, int]]]:
-        """Read embedded MFace authoring data from the render mesh.
+    def _validate_pc_mface_declaration_layout(
+        self,
+        segments: Sequence[Segment],
+        virt_segments: Sequence[VirtSegment],
+        vertices: Sequence[MVertex],
+        vertex_weights: Sequence[tuple[int, int, float]],
+        faces: Sequence[MFace],
+    ) -> None:
+        if not vertices:
+            return
+        segment_count = len(segments or [])
+        vertex_count = len(vertices)
+        if segment_count <= 0:
+            raise ValueError('PC model has vertex declarations but no Segments.')
 
-        MFacePoint is a POINT-domain integer attribute.  Each render vertex
-        belongs to exactly one authored wet/dirty point.  Export may split an
-        authored point into multiple runtime ranges when the final vertex order
-        requires it, for example when the point spans different bone/weight
-        buckets.
-        """
+        normalized_weights: List[tuple[int, int, float]] = []
+        for vertex_index in range(vertex_count):
+            weight_tuple = vertex_weights[vertex_index] if vertex_index < len(vertex_weights) else (int(vertices[vertex_index].segment), -1, 0.0)
+            normalized_weights.append(self._normalize_export_weight(weight_tuple, segment_count))
+
+        # Base Segment ranges must be disjoint, contiguous across non-empty
+        # segments, and contain only rigid declarations owned by that Segment.
+        expected_base_start = 0
+        base_vertex_owner: Dict[int, int] = {}
+        for segment in segments:
+            segment_index = int(segment.index)
+            first = int(segment.first_vertex)
+            last = int(segment.last_vertex)
+            if last < first:
+                continue
+            if first < 0 or last >= vertex_count:
+                raise ValueError(f'Segment {segment_index} has invalid declaration range {first}-{last}.')
+            if first != expected_base_start:
+                raise ValueError(
+                    f'Segment {segment_index} begins at declaration {first}, expected {expected_base_start}; '
+                    'ordinary Segment declarations must form the leading contiguous region.'
+                )
+            for vertex_index in range(first, last + 1):
+                if vertex_index in base_vertex_owner:
+                    raise ValueError(f'Segment declaration {vertex_index} is owned by more than one Segment.')
+                base_vertex_owner[vertex_index] = segment_index
+                primary, secondary, weight = normalized_weights[vertex_index]
+                if secondary >= 0 and secondary != primary and weight > 1e-6:
+                    raise ValueError(
+                        f'Segment {segment_index} range {first}-{last} contains weighted declaration {vertex_index}; '
+                        'two-weight declarations must live only in the VirtSegment tail.'
+                    )
+                if int(primary) != segment_index or int(vertices[vertex_index].segment) != segment_index:
+                    raise ValueError(
+                        f'Segment {segment_index} declaration {vertex_index} resolves to transform '
+                        f'{vertices[vertex_index].segment}/primary {primary}.'
+                    )
+            expected_base_start = last + 1
+
+        weighted_tail_start = int(expected_base_start)
+        expected_virt_start = weighted_tail_start
+        previous_pair: Optional[tuple[int, int]] = None
+        covered_weighted: set[int] = set()
+
+        for virt_index, virt in enumerate(virt_segments or []):
+            first = int(virt.first_vertex)
+            last = int(virt.last_vertex)
+            transform_id = int(segment_count + virt_index)
+            primary = int(virt.index)
+            secondary = int(virt.weight_index)
+            weight = float(virt.weight)
+            pair = (primary, secondary)
+
+            if first < 0 or last < first or last >= vertex_count:
+                raise ValueError(f'VirtSegment {virt_index} has an invalid declaration range {first}-{last}.')
+            if first != expected_virt_start:
+                raise ValueError(
+                    f'VirtSegment {virt_index} begins at declaration {first}, expected {expected_virt_start}; '
+                    'VirtSegments must form one contiguous tail immediately after the base Segment region.'
+                )
+            if primary < 0 or primary >= segment_count or secondary < 0 or secondary >= segment_count:
+                raise ValueError(
+                    f'VirtSegment {virt_index} has invalid segment pair {primary}/{secondary} for {segment_count} Segments.'
+                )
+            if primary == secondary:
+                raise ValueError(f'VirtSegment {virt_index} uses the same primary and secondary Segment {primary}.')
+            if previous_pair is not None and pair < previous_pair:
+                raise ValueError(
+                    f'VirtSegment pair order regressed from {previous_pair[0]}/{previous_pair[1]} '
+                    f'to {primary}/{secondary}; original PC files order the weighted tail by this pair.'
+                )
+            previous_pair = pair
+
+            for vertex_index in range(first, last + 1):
+                if vertex_index in base_vertex_owner:
+                    raise ValueError(
+                        f'VirtSegment {virt_index} declaration {vertex_index} overlaps base Segment '
+                        f'{base_vertex_owner[vertex_index]}.'
+                    )
+                if vertex_index in covered_weighted:
+                    raise ValueError(f'Weighted declaration {vertex_index} belongs to more than one VirtSegment.')
+                covered_weighted.add(vertex_index)
+                if int(vertices[vertex_index].segment) != transform_id:
+                    raise ValueError(
+                        f'VirtSegment {virt_index} declaration {vertex_index} uses transform '
+                        f'{vertices[vertex_index].segment}, expected {transform_id}.'
+                    )
+                vp, vs, vw = normalized_weights[vertex_index]
+                if int(vp) != primary or int(vs) != secondary or abs(float(vw) - weight) > 1e-5:
+                    raise ValueError(
+                        f'VirtSegment {virt_index} declaration {vertex_index} has weight tuple '
+                        f'{vp}/{vs}@{vw:.6f}, expected {primary}/{secondary}@{weight:.6f}.'
+                    )
+            expected_virt_start = last + 1
+
+        if virt_segments:
+            if int(virt_segments[0].first_vertex) != weighted_tail_start:
+                raise ValueError(
+                    f'First VirtSegment begins at {virt_segments[0].first_vertex}, expected weighted tail '
+                    f'to begin at {weighted_tail_start}.'
+                )
+            if expected_virt_start != vertex_count:
+                raise ValueError(
+                    f'VirtSegment tail ends at declaration {expected_virt_start - 1}, but model has '
+                    f'{vertex_count} declarations; every declaration after the base Segment region must be weighted.'
+                )
+        elif weighted_tail_start != vertex_count:
+            raise ValueError(
+                f'Model has {vertex_count - weighted_tail_start} declarations after the base Segment region '
+                'but no VirtSegments.'
+            )
+
+        # Every vertex in the base region must have been covered by exactly one
+        # Segment.  Every vertex in the weighted tail must have been covered by
+        # exactly one VirtSegment.
+        if len(base_vertex_owner) != weighted_tail_start:
+            raise ValueError('Base Segment declaration coverage is incomplete.')
+        if len(covered_weighted) != vertex_count - weighted_tail_start:
+            raise ValueError('VirtSegment declaration coverage is incomplete.')
+
+        if not faces:
+            return
+        for face_index, face in enumerate(faces):
+            starts = (int(face.v0), int(face.v1), int(face.v2))
+            counts = (
+                max(1, int(face.same_vert_bits) & 0x1F),
+                max(1, (int(face.same_vert_bits) >> 5) & 0x1F),
+                max(1, (int(face.same_vert_bits) >> 10) & 0x1F),
+            )
+            for corner, (start, count) in enumerate(zip(starts, counts)):
+                if count > 31:
+                    raise ValueError(f'MFace {face_index} corner {corner} has invalid SameVertBits count {count}.')
+                end = start + count - 1
+                if start < 0 or end >= vertex_count:
+                    raise ValueError(
+                        f'MFace {face_index} corner {corner} declares invalid vertex range {start}-{end} '
+                        f'for {vertex_count} vertices.'
+                    )
+                transform_id = int(vertices[start].segment)
+                for vertex_index in range(start, end + 1):
+                    if int(vertices[vertex_index].segment) != transform_id:
+                        raise ValueError(
+                            f'MFace {face_index} corner {corner} declaration range {start}-{end} crosses '
+                            f'vertex transform IDs at {vertex_index}.'
+                        )
+                if transform_id < segment_count:
+                    segment = segments[transform_id]
+                    if start < int(segment.first_vertex) or end > int(segment.last_vertex):
+                        raise ValueError(
+                            f'MFace {face_index} corner {corner} range {start}-{end} falls outside '
+                            f'base Segment {transform_id} range {segment.first_vertex}-{segment.last_vertex}.'
+                        )
+                else:
+                    virt_index = transform_id - segment_count
+                    if virt_index < 0 or virt_index >= len(virt_segments):
+                        raise ValueError(
+                            f'MFace {face_index} corner {corner} references unknown virtual transform {transform_id}.'
+                        )
+                    virt = virt_segments[virt_index]
+                    if start < int(virt.first_vertex) or end > int(virt.last_vertex):
+                        raise ValueError(
+                            f'MFace {face_index} corner {corner} range {start}-{end} falls outside '
+                            f'VirtSegment {virt_index} range {virt.first_vertex}-{virt.last_vertex}.'
+                        )
+
+    def _mface_embedded_data(self, mesh_obj, mesh) -> tuple[Dict[int, int], List[Tuple[int, int, int]]]:
         try:
             bind_attr = getattr(mesh, 'attributes', None).get('MFacePoint') if getattr(mesh, 'attributes', None) is not None else None
         except Exception:
@@ -4654,10 +4941,6 @@ class TRLAUModelExporter:
         except Exception:
             pass
 
-        # Store triangle corners as render local vertex indices, not only as the
-        # authored MFacePoint ids.  The final export step needs the source corner
-        # vertex so it can choose the automatically split runtime point when one
-        # authored point spans several bone/weight export buckets.
         triangles: List[Tuple[int, int, int]] = []
         for tri in getattr(mesh, 'loop_triangles', []) or []:
             local_vertices: List[int] = []
@@ -4735,8 +5018,6 @@ class TRLAUModelExporter:
             range_by_group[group] = (int(start), int(count))
 
         result: List[MFace] = []
-        skipped_degenerate = 0
-        missing_range_count = 0
         height_lookup = mface_height_by_local_vertex or {}
 
         def triangle_top_down_key(item):
@@ -4755,27 +5036,15 @@ class TRLAUModelExporter:
                 raise ValueError(
                     f'Mesh "{getattr(mesh_obj, "name", "Mesh")}" contains an MFace triangle using vertex {int(exc.args[0])}, but that vertex has no MFacePoint export group.'
                 ) from exc
-            # If two corners resolve to the same runtime point, the MFace entry
-            # would be degenerate.  This can happen after the user deliberately
-            # merges adjacent render vertices into one MFacePoint, so skip it.
-            if groups[0] == groups[1] or groups[1] == groups[2] or groups[0] == groups[2]:
-                skipped_degenerate += 1
-                continue
             try:
                 ranges = [range_by_group[group] for group in groups]
             except KeyError as exc:
-                missing_range_count += 1
                 raise ValueError(
                     f'Mesh "{getattr(mesh_obj, "name", "Mesh")}" contains an MFace triangle using point {exc.args[0]!r}, but no render vertices export from that point.'
                 ) from exc
             same_bits = (int(ranges[0][1]) & 0x1F) | ((int(ranges[1][1]) & 0x1F) << 5) | ((int(ranges[2][1]) & 0x1F) << 10)
             result.append(MFace(index=len(result), v0=int(ranges[0][0]), v1=int(ranges[1][0]), v2=int(ranges[2][0]), same_vert_bits=int(same_bits) & 0xFFFF))
 
-        # Export-time MFace adaptation is intentionally quiet. The exporter may
-        # split authored points into runtime ranges, skip degenerate generated
-        # triangles, or chunk ranges to fit SameVertBits. Those are expected
-        # internal conversions, not user-facing export warnings. Fatal structural
-        # problems above still raise ValueError and stop export.
         return result
 
     @staticmethod
@@ -4899,12 +5168,6 @@ class TRLAUModelExporter:
             return 0
 
     def _strip_key(self, material, material_index: int, mesh_obj=None) -> tuple:
-        # TextureStripInfo is a draw list for a material, not for a face.
-        # Imported models may carry stale per-strip metadata such as
-        # trlau_texture_strip_index/trlau_material_group, so those fields must
-        # not split the export back into one TextureStripInfo per source face or
-        # source strip.  Group by the actual Blender material datablock first;
-        # all triangles assigned to that material are appended to one index list.
         if material is not None:
             try:
                 pointer = int(material.as_pointer())
@@ -4928,17 +5191,7 @@ class TRLAUModelExporter:
             return None
 
     def _segment_origin_local(self, arm_obj, bone_index: int) -> Vector:
-        """Return the game segment origin in armature-local space.
 
-        TRLAU HInfo and ClothSetup records are stored relative to the segment
-        pivot/origin. Blender bones also carry an orientation, but their tail
-        direction is an editor/display detail for this exporter and must not
-        rotate authored helper offsets. Earlier code used bone.matrix_local,
-        which silently assumed every bone shaft pointed along local +Y. If a
-        user adjusted bone tails, HInfo and cloth collision data exported at a
-        rotated/rebased position. Use the bone head only so exported data
-        depends on the segment pivot, not on the visual bone tail axis.
-        """
         bone = self._bone_for_index(arm_obj, bone_index)
         if bone is not None:
             try:
@@ -4968,7 +5221,6 @@ class TRLAUModelExporter:
                 return world_matrix.copy()
 
     def _point_relative_to_segment_origin(self, world_point: Vector, arm_obj, bone_index: int) -> Tuple[Vector, Vector]:
-        """Return (segment-local offset, armature-local absolute position)."""
         if arm_obj is not None:
             try:
                 arm_local = arm_obj.matrix_world.inverted_safe() @ world_point
@@ -4996,9 +5248,6 @@ class TRLAUModelExporter:
             except Exception:
                 return world_matrix
 
-        # Fallback for non-standard export calls that did not snapshot helpers.
-        # Still derive from world space and the segment origin so bone tail/roll
-        # edits do not affect exported HInfo/Target transforms.
         try:
             world_matrix = self._export_object_world_matrix(obj)
         except Exception:
@@ -5464,12 +5713,6 @@ class TRLAUModelExporter:
             if candidate.is_file() and candidate.name.lower().endswith(suffix):
                 return _section_index_from_filename(candidate.name), candidate.name
 
-        # Direct DRM export works from a temporary extraction that usually has no
-        # sectionList.txt.  Allocating from len(section_list.entries) can then
-        # collide with untouched sections that already exist in the extracted DRM
-        # folder, producing duplicate names such as 30_0.gnc and 30_<id>.pcd and
-        # making the repacker fail.  Allocate after every section index already
-        # present on disk as well as every index recorded in sectionList.txt.
         used_indices = set(section_list.used_indices())
         for candidate in directory.iterdir():
             if not candidate.is_file():

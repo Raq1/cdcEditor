@@ -68,15 +68,6 @@ def _next_power_of_two(value: int) -> int:
 
 
 def _safe_texture_dimensions(width: int, height: int) -> tuple[int, int, bool]:
-    """Return dimensions that are safe for the TRLAU DXT texture path.
-
-    The original game asset pipeline appears to assume legacy D3D9-style DXT
-    textures with power-of-two dimensions and at least one complete 4x4 block
-    in each axis. Tiny/non-power-of-two exports such as 8x2 can be encoded by
-    DirectXTex, but the game can crash while loading them. Resizing the temporary
-    export copy keeps the source Blender image untouched and avoids writing a
-    PCD that the game loader may not handle.
-    """
     src_width = max(1, int(width or 1))
     src_height = max(1, int(height or 1))
     safe_width = max(_MIN_SAFE_DXT_DIMENSION, _next_power_of_two(src_width))
@@ -88,7 +79,6 @@ def _safe_texture_dimensions(width: int, height: int) -> tuple[int, int, bool]:
 
 
 def _expected_full_mip_count(width: int, height: int) -> int:
-    """Return the full DDS mip chain length including the base level."""
     mip_width = max(1, int(width or 1))
     mip_height = max(1, int(height or 1))
     levels = 1
@@ -100,14 +90,6 @@ def _expected_full_mip_count(width: int, height: int) -> int:
 
 
 def _expected_trlau_mip_count(width: int, height: int) -> int:
-    """Return the DDS level count to store in exported TRLAU texture payloads.
-
-    TRLAU PC/Xbox PCD textures do not use the Direct3D-style full mip chain
-    for rectangular textures. The original files stop once either dimension has
-    reached one texel, so a 256x128 DXT texture stores levels down to 2x1
-    (PCD mip field 7), while a square 256x256 texture still stores the 1x1
-    level. This is more precise than blindly subtracting one from a full chain.
-    """
     mip_width = max(1, int(width or 1))
     mip_height = max(1, int(height or 1))
     levels = 1

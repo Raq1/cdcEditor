@@ -718,7 +718,7 @@ class DRMContainerParser:
 
         if int(getattr(section, 'drm_version', 0)) == 19:
             return f'{section.index}_{section.section_id:x}{suffix}'
-        if suffix == '.pcd':
+        if suffix in {'.ani', '.pcd'}:
             return f'{section.index}_{section.section_id:x}{suffix}'
         return f'{section.index}_0{suffix}'
 

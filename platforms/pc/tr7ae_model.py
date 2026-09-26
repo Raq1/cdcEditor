@@ -234,13 +234,6 @@ class TRModelParser(GameCubeModelParserMixin):
         absolute_offset: int,
         strips: List[TextureStrip],
     ) -> None:
-        """Read Model::scrollInfo and attach it to the matching TextureStripInfo.
-
-        PC model ScrollInfo uses the same 20-byte entry body as level
-        octreeScrollInfo, but its fixup pointer targets the model strip
-        scrollOffset field (TextureStripInfo + 0x0C).  The pointer is relocated
-        to the section that owns TextureStripInfo.
-        """
         if absolute_offset <= 0 or not self._is_valid_abs(scroll_context, absolute_offset, 4):
             return
 

@@ -79,13 +79,7 @@ class MVertex:
     gc_primary_segment: int = -1
     gc_secondary_segment: int = -1
     gc_secondary_weight: float = 0.0
-    # PSP vertex streams carry a 16-bit lighting value plus alpha/mask data in
-    # the two bytes immediately before packed normals.  Other platforms leave
-    # this unset and continue to use ModelData.vertex_colors when available.
     psp_color_rgba: Optional[Tuple[int, int, int, int]] = None
-    # PS3 render-stream secondary vertex attributes carry a 4-byte color or
-    # baked-lighting value.  It is stored separately from PSP color data so the
-    # material builder can use the correct attribute name and alpha scale.
     ps3_color_rgba: Optional[Tuple[int, int, int, int]] = None
     # TR8/Underworld vertices can carry explicit four-bone skinning.  Older
     # LAU formats keep single/virtual segment skinning and leave this unset.
@@ -164,26 +158,14 @@ class TextureStrip:
     tr8_detail_ao_texture_id: int = -1
     tr8_mask_texture_id: int = -1
     tr8_reflection_texture_id: int = -1
-    # PS2 Underworld draw-run state recovered from the 0x28-byte material/run table.
-    # tr8_ps2_alpha_blend is retained as metadata only; the PS2 GS alpha state
-    # is not mapped one-to-one to Blender blend modes yet.
     tr8_ps2_run_flags: int = 0
     tr8_ps2_alpha_blend: bool = False
     tr8_ps2_material_index: int = -1
-    # Some PS2 Underworld runs use two texture stages.  The recovered Lara eye
-    # material uses the secondary stage as the base eye map and the primary
-    # stage as an alpha overlay for lashes.
     tr8_ps2_stage_blend_mode: str = ''
-    # TR8/Underworld render batches can use different vertex-format blocks.
-    # Keep the owning batch on each strip so the Blender importer can split
-    # mixed-format meshes into separate Blender mesh objects.
     tr8_batch_index: int = -1
     tr8_vertex_format_offset: int = -1
     tr8_palette_source_index: int = -1
     tr8_geometry_source_index: int = -1
-    # Underworld can author double-sided surfaces as paired face records with
-    # identical vertices and opposite winding.  Import keeps only one editable
-    # Blender face and preserves the material-level intent here.
     tr8_double_sided: bool = False
     tr8_double_wound_pair_count: int = 0
     # TR7 PC next-generation render-data material state. These fields mirror
@@ -234,11 +216,6 @@ class TextureStrip:
     pc_nextgen_specular_texture_id: int = -1
     # Number of triangles whose index data requested reversed winding during import.
     pc_nextgen_reversed_winding_count: int = 0
-    # True when this material group contains paired triangles with the same
-    # vertices and opposite winding. PC next-gen uses this as a face-data level
-    # double-sided representation rather than a legacy tpage material flag.
-    # Import collapses those pairs to one editable Blender face; export expands
-    # them back when the material's Double Sided setting is enabled.
     pc_nextgen_double_sided: bool = False
     pc_nextgen_double_wound_pair_count: int = 0
     pc_nextgen_index_data_offset_extra: int = 0
@@ -380,8 +357,4 @@ class ModelData:
     # Import-side face-orientation correction count for PC next-gen/Underworld-
     # style streams whose face data can request the opposite normal direction.
     pc_nextgen_vertex_normal_oriented_face_count: int = 0
-    # PS3-only: true for the alternate external render-stream layout where
-    # auxiliary texture stages have been observed to include usable normal-map
-    # bindings.  Inline PS3 streams keep the raw candidate IDs but do not wire
-    # them into Blender normals by default.
     ps3_external_render_stream: bool = False

@@ -24,6 +24,7 @@ from ..core.log import logger
 from ..core.markup_utils import add_markup_bbox_wire
 from ..core.fsfx_render_effect import store_fsfx_render_effect_properties
 from ..core.cine_format import parse_cine_section, first_cinematic_command
+from ..core.level_combat import encode_combat_graph
 from ..platforms.common.drm_container import DRMContainerParser
 from ..platforms.pc.area_dbase import AreaDBaseData, AreaDBaseParser, _convert_level_position, convert_area_dbase_center_position
 from ..platforms.pc.tr7ae_level import TRLevelBuilder, TRLevelParser
@@ -40,6 +41,7 @@ from ..ui.level_panel import (
     SFX_PANEL_FLOAT_NAMES,
     SFX_PANEL_STRING_NAMES,
     SFX_PANEL_VECTOR_NAMES,
+    trlau_load_level_combat_property,
 )
 
 
@@ -82,6 +84,11 @@ LEVEL_METADATA_FIELDS = (
     'streamUnitID',
     'playerName',
     'playerObjectID',
+    'areaDBaseMoveDataOffset',
+    'areaDBasePlannerDataOffset',
+    'areaDBaseRuntimeObjectOffset',
+    'areaDBaseHeaderContentOffset',
+    'areaDBaseSourceSectionIndex',
 )
 
 LEVEL_METADATA_PROP_PREFIX = 'trlau_level_'
@@ -90,6 +97,7 @@ LEVEL_METADATA_PROP_PREFIX = 'trlau_level_'
 SECTION_BLOB_CHUNK_SIZE = 30000
 SECTION_BLOB_PROP_PREFIX = 'trlau_section_blob_'
 TERRAIN_LIGHT_GRID_BLOB_PROP_PREFIX = 'trlau_terrain_light_grid_blob_'
+COMBAT_BLOB_PROP_PREFIX = 'trlau_combat_blob_'
 
 _SFX_STREAM_STRUCT = '<IBBBBIBbBxfHHfffIb'
 _SFX_STREAM_SIZE = struct.calcsize(_SFX_STREAM_STRUCT)
@@ -1341,6 +1349,7 @@ class LevelImporterMixin:
         self._set_custom_property(empty, 'trlau_section_file_name', str(section_path.name))
         self._set_custom_property(empty, 'trlau_section_source_path', str(section_path))
         self._set_custom_property(empty, 'trlau_section_original_id', int(section_id))
+        self._set_custom_property(empty, 'trlau_section_original_index', int(self._section_index_from_filename(section_path)))
 
         try:
             raw_data = section_path.read_bytes()
@@ -2047,7 +2056,8 @@ class LevelImporterMixin:
             self._remove_stale_cine_section_children(empty)
 
             try:
-                section_index = int(entry.get('section_index', -1) or -1)
+                raw_section_index = entry.get('section_index', -1)
+                section_index = -1 if raw_section_index is None else int(raw_section_index)
             except Exception:
                 section_index = -1
             try:
@@ -2055,10 +2065,6 @@ class LevelImporterMixin:
             except Exception:
                 section_id = 0
 
-            # A UnitData Cine array entry is itself the CineData resource in the
-            # Blender hierarchy.  Older builds created a wrapper plus a child
-            # "_Section" empty with the real data, which duplicated the same
-            # cinematic and made selection/export ambiguous.
             if section_index >= 0 or section_id > 0 or entry.get('cine_structured') or entry.get('name'):
                 self._set_custom_property(empty, 'trlau_section_metadata_empty', True)
                 self._set_custom_property(empty, 'trlau_section_role', 'Cine')
@@ -2109,7 +2115,8 @@ class LevelImporterMixin:
             if not bool(obj.get('trlau_unitdata_fsfx_link_empty')):
                 continue
             try:
-                obj_index = int(obj.get('trlau_unitdata_fsfx_index', -1) or -1)
+                raw_index = obj.get('trlau_unitdata_fsfx_index', -1)
+                obj_index = -1 if raw_index is None else int(raw_index)
             except Exception:
                 obj_index = -1
             if obj_index == int(index):
@@ -2132,7 +2139,8 @@ class LevelImporterMixin:
             if not bool(obj.get('trlau_unitdata_cine_empty')):
                 continue
             try:
-                obj_index = int(obj.get('trlau_unitdata_cine_index', -1) or -1)
+                raw_index = obj.get('trlau_unitdata_cine_index', -1)
+                obj_index = -1 if raw_index is None else int(raw_index)
             except Exception:
                 obj_index = -1
             if obj_index == int(index):
@@ -2151,7 +2159,8 @@ class LevelImporterMixin:
             except Exception:
                 index = int(entry_index)
             try:
-                section_index = int(entry.get('section_index', -1) or -1)
+                raw_section_index = entry.get('section_index', -1)
+                section_index = -1 if raw_section_index is None else int(raw_section_index)
             except Exception:
                 section_index = -1
             try:
@@ -2197,6 +2206,11 @@ class LevelImporterMixin:
             self._set_custom_property(cine_empty, 'trlau_unitdata_cine_empty', True)
             self._set_custom_property(cine_empty, 'trlau_unitdata_cine_index', int(index))
             self._set_custom_property(cine_empty, 'trlau_cine_section_index', int(self._section_index_from_filename(section_path)))
+            try:
+                target_offset = int(entry.get('target_offset', 0) or 0)
+            except Exception:
+                target_offset = 0
+            self._set_custom_property(cine_empty, 'trlau_cine_payload_offset', int(target_offset))
             self._clean_unitdata_cine_wrapper_props(cine_empty)
             self._remove_stale_cine_section_children(cine_empty)
 
@@ -2357,6 +2371,18 @@ class LevelImporterMixin:
         empty.rotation_euler = (0.0, 0.0, 0.0)
         empty.scale = (1.0, 1.0, 1.0)
         self._clear_area_dbase_object_metadata(empty)
+        if section_path is not None:
+            try:
+                raw_section_data = Path(section_path).read_bytes()
+            except Exception as exc:
+                logger.warning('Failed to embed AreaDBase source section %s: %s', section_path, exc)
+            else:
+                if raw_section_data:
+                    self._store_section_blob_metadata(empty, raw_section_data)
+                    self._set_custom_property(empty, 'trlau_area_dbase_use_embedded_source', True)
+                    self._set_custom_property(empty, 'trlau_area_dbase_embedded_source_size', int(len(raw_section_data)))
+                    self._set_custom_property(empty, 'trlau_section_role', 'AreaDBase')
+                    self._set_custom_property(empty, 'trlau_section_file_name', Path(section_path).name)
         return empty
 
     @staticmethod
@@ -2740,6 +2766,35 @@ class LevelImporterMixin:
                 logger.warning('Failed to import AreaDBase section %s: %s', section_path.name, exc)
         return results
 
+    def _build_combat_data_metadata(self, collection, root_obj, level) -> None:
+        graph = dict(getattr(level, 'combat_data', {}) or {})
+        if not graph:
+            return
+        combat_obj = self._get_or_create_component_empty(collection, 'CombatData', display_size=64.0)
+        combat_obj.parent = root_obj
+        combat_obj.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        self._set_custom_property(combat_obj, 'trlau_type', 'CombatData')
+        self._set_custom_property(combat_obj, 'trlau_combat_data_empty', True)
+        try:
+            for key in list(combat_obj.keys()):
+                if str(key).startswith(COMBAT_BLOB_PROP_PREFIX):
+                    del combat_obj[key]
+            for key in ('trlau_combat_blob_encoding', 'trlau_combat_blob_chunk_count', 'trlau_combat_blob_size'):
+                if key in combat_obj:
+                    del combat_obj[key]
+        except Exception:
+            pass
+        blob = encode_combat_graph(graph)
+        encoded = base64.b64encode(blob).decode('ascii') if blob else ''
+        chunk_count = 0
+        for offset in range(0, len(encoded), SECTION_BLOB_CHUNK_SIZE):
+            combat_obj[f'{COMBAT_BLOB_PROP_PREFIX}{chunk_count:04d}'] = encoded[offset:offset + SECTION_BLOB_CHUNK_SIZE]
+            chunk_count += 1
+        combat_obj['trlau_combat_blob_encoding'] = 'zlib+base64+json'
+        combat_obj['trlau_combat_blob_chunk_count'] = int(chunk_count)
+        combat_obj['trlau_combat_blob_size'] = int(len(blob))
+        trlau_load_level_combat_property(combat_obj, dict(graph.get('summary', {}) or {}), embedded=True)
+
     def _build_level_metadata(self, collection, level):
         self._current_level_scene_center_offset = tuple(float(v) for v in getattr(level, 'scene_center_offset', (0.0, 0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0, 0.0))
         if len(self._current_level_scene_center_offset) < 4:
@@ -2753,6 +2808,7 @@ class LevelImporterMixin:
         self._build_unit_data_metadata(collection, level)
         self._build_admd_metadata(collection, level)
         self._build_reloc_module_metadata(collection, root_obj, level)
+        self._build_combat_data_metadata(collection, root_obj, level)
         source_game = str(getattr(level, 'source_game', '') or '').strip().lower()
         if source_game not in {'legend', 'anniversary'}:
             source_game = 'legend'
@@ -2912,12 +2968,6 @@ class LevelImporterMixin:
                     pass
 
     def _clean_level_component_custom_properties(self, collection, root_obj=None) -> None:
-        """Remove import-only selector/cache properties from level scene objects.
-
-        Export should derive component identity from the normal import hierarchy,
-        object names, transforms, materials and geometry.  Keep custom properties
-        only for values that are not represented in Blender scene data.
-        """
         objects = list(getattr(collection, 'all_objects', None) or collection.objects)
         for obj in objects:
             try:
