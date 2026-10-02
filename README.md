@@ -46,9 +46,10 @@ You can import cutscenes, and import the animations relative to the models.
 Currently, the only way to recognize which InstanceID refers to which character except Lara (whom is always -1), is to run the game and the desired cutscene, and look at the InstanceIDs through Indra's TRLAU Hook.
 
 ---
-# Known Issues
+# Known Limitations
 
 - Not every level exports correctly and the game may crash
+- No dedicated texture tools for .PCD and .RAW yet
 
 ---
 # Credits
